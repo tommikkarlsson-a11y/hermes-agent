@@ -148,6 +148,24 @@ def _stub_plugin_discovery(monkeypatch):
 
 
 
+def test_oneshot_tags_persistence_as_tool_and_restores_source(monkeypatch, capsys):
+    import hermes_cli.oneshot as oneshot
+
+    observed_sources = []
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")
+
+    def fake_run_agent(*_args, **_kwargs):
+        observed_sources.append(os.environ.get("HERMES_SESSION_SOURCE"))
+        return "ok", {"final_response": "ok", "failed": False, "partial": False}
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+
+    assert oneshot.run_oneshot("hello") == 0
+    assert observed_sources == ["tool"]
+    assert os.environ["HERMES_SESSION_SOURCE"] == "cli"
+    assert capsys.readouterr().out == "ok\n"
+
+
 def test_oneshot_wires_session_db_for_recall(monkeypatch):
     """hermes -z bypasses HermesCLI, but recall still needs SessionDB."""
     from hermes_cli.oneshot import _run_agent
@@ -213,6 +231,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["platform"] == "cli"
     assert captured["prompt"] == "recall this"
 
 
