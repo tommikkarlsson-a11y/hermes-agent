@@ -16,6 +16,56 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+def test_exact_mcp_tool_provenance_and_read_only_accessors():
+    from tools import mcp_tool
+
+    registry_name = "mcp__foo_bar__read_file"
+    saved_server = mcp_tool._mcp_tool_server_names.get(registry_name)
+    saved_provenance = mcp_tool._mcp_tool_provenance.get(registry_name)
+    saved_hints = dict(mcp_tool._tool_read_only_hints.get("foo-bar", {}))
+    try:
+        mcp_tool._track_mcp_tool_server(registry_name, "foo-bar", "read-file")
+        mcp_tool._tool_read_only_hints["foo-bar"] = {"read-file": True, "write": False}
+        assert mcp_tool.get_mcp_tool_provenance(registry_name) == mcp_tool.MCPToolProvenance(
+            server_name="foo-bar", raw_tool_name="read-file"
+        )
+        assert mcp_tool.is_mcp_tool_read_only("foo-bar", "read-file") is True
+        assert mcp_tool.is_mcp_tool_read_only("foo-bar", "write") is False
+        assert mcp_tool.is_mcp_tool_read_only("foo-bar", "missing") is False
+        mcp_tool._forget_mcp_tool_server(registry_name)
+        assert mcp_tool.get_mcp_tool_provenance(registry_name) is None
+    finally:
+        if saved_server is not None:
+            mcp_tool._mcp_tool_server_names[registry_name] = saved_server
+        else:
+            mcp_tool._mcp_tool_server_names.pop(registry_name, None)
+        if saved_provenance is not None:
+            mcp_tool._mcp_tool_provenance[registry_name] = saved_provenance
+        else:
+            mcp_tool._mcp_tool_provenance.pop(registry_name, None)
+        mcp_tool._tool_read_only_hints["foo-bar"] = saved_hints
+
+
+def test_mcp_client_runtime_state_reports_handlers_without_exposing_server():
+    from tools import mcp_tool
+
+    server = SimpleNamespace(_sampling=object(), _elicitation=None)
+    saved = mcp_tool._servers.get("runtime-test")
+    try:
+        mcp_tool._servers["runtime-test"] = server
+        assert mcp_tool.get_mcp_client_runtime_state("runtime-test") == {
+            "live": True,
+            "sampling_handler": True,
+            "elicitation_handler": False,
+        }
+        assert mcp_tool.get_mcp_client_runtime_state("lazy-runtime-test") == {"live": False}
+    finally:
+        if saved is None:
+            mcp_tool._servers.pop("runtime-test", None)
+        else:
+            mcp_tool._servers["runtime-test"] = saved
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

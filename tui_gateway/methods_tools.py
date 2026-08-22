@@ -4,11 +4,106 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+import types
+
 from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
+
+_MCP_CLIENT_ERROR_CODES = {
+    "MCP_CLIENT_INVALID_PARAMS": 4600,
+    "MCP_CLIENT_PROFILE_UNSUPPORTED": 4601,
+    "MCP_CLIENT_DISABLED": 4602,
+    "MCP_CLIENT_SERVER_UNAVAILABLE": 4603,
+    "MCP_CLIENT_TOOL_DENIED": 4604,
+    "MCP_CLIENT_NOT_READ_ONLY": 4605,
+    "MCP_CLIENT_INTERACTIVE_RUNTIME": 4606,
+    "MCP_CLIENT_BUSY": 4607,
+    "MCP_CLIENT_RESULT_CONTRACT": 4608,
+}
+
+
+def _mcp_client_profile_guard(rid, params):
+    """Fail before config/registry access when the process-global profile differs."""
+    requested = params.get("profile") if isinstance(params, dict) else None
+    if not isinstance(requested, str) or not requested.strip():
+        return _err(rid, 4600, "profile is required")
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        requested_name = normalize_profile_name(requested)
+        launch_name = normalize_profile_name(_current_profile_name())
+    except Exception:
+        return _err(rid, 4600, "invalid profile")
+    if requested_name != launch_name:
+        return _err(rid, 4601, "MCP client access supports only the gateway launch profile")
+    return None
+
+
+def _mcp_client_params(rid, params, *, require_tool=False):
+    profile_error = _mcp_client_profile_guard(rid, params)
+    if profile_error:
+        return None, profile_error
+    server_name = params.get("server")
+    tool_name = params.get("tool") if require_tool else None
+    from tools.mcp_client_access import _valid_exact_name
+
+    if not _valid_exact_name(server_name):
+        return None, _err(rid, 4600, "invalid server name")
+    if require_tool and not _valid_exact_name(tool_name):
+        return None, _err(rid, 4600, "invalid tool name")
+    return (server_name, tool_name), None
+
+
+@method("mcp.client.status")
+def _(rid, params: dict) -> dict:
+    parsed, error = _mcp_client_params(rid, params)
+    if error:
+        return error
+    from tools.mcp_client_access import MCPClientAccessError, get_mcp_client_status
+
+    try:
+        with _mcp_reload_lock:
+            result = get_mcp_client_status(parsed[0])
+    except MCPClientAccessError as exc:
+        return _err(rid, _MCP_CLIENT_ERROR_CODES.get(exc.code, 4608), str(exc))
+    return _ok(rid, result)
+
+
+@method("mcp.client.tools")
+def _(rid, params: dict) -> dict:
+    parsed, error = _mcp_client_params(rid, params)
+    if error:
+        return error
+    from tools.mcp_client_access import MCPClientAccessError, list_mcp_client_tools
+
+    try:
+        with _mcp_reload_lock:
+            tools = list_mcp_client_tools(parsed[0])
+    except MCPClientAccessError as exc:
+        return _err(rid, _MCP_CLIENT_ERROR_CODES.get(exc.code, 4608), str(exc))
+    return _ok(rid, {"server": parsed[0], "tools": tools})
+
+
+@method("mcp.client.call")
+def _(rid, params: dict) -> dict:
+    parsed, error = _mcp_client_params(rid, params, require_tool=True)
+    if error:
+        return error
+    from dataclasses import asdict
+    from tools.mcp_client_access import MCPClientAccessError, call_mcp_client_tool
+
+    try:
+        # Stabilize registry provenance, read-only metadata, and interactive
+        # handlers across authorization and dispatch. MCP reload uses this same
+        # lock for shutdown+discovery.
+        with _mcp_reload_lock:
+            result = call_mcp_client_tool(parsed[0], parsed[1], params.get("arguments"))
+    except MCPClientAccessError as exc:
+        return _err(rid, _MCP_CLIENT_ERROR_CODES.get(exc.code, 4608), str(exc))
+    return _ok(rid, asdict(result))
 
 
 @method("system.battery")
@@ -2576,4 +2671,13 @@ def _(rid, params: dict) -> dict:
 
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
+    server._MCP_CLIENT_ERROR_CODES = _MCP_CLIENT_ERROR_CODES
+    server._mcp_client_profile_guard = types.FunctionType(
+        _mcp_client_profile_guard.__code__, vars(server), _mcp_client_profile_guard.__name__
+    )
+    server._mcp_client_params = types.FunctionType(
+        _mcp_client_params.__code__, vars(server), _mcp_client_params.__name__,
+        _mcp_client_params.__defaults__, _mcp_client_params.__closure__,
+    )
+    server._mcp_client_params.__kwdefaults__ = _mcp_client_params.__kwdefaults__
     _registry.install(server)

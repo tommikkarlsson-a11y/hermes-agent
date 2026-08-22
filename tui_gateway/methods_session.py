@@ -234,6 +234,7 @@ def _(rid, params: dict) -> dict:
                 s
                 for s in db.list_sessions_rich(
                     source=None,
+                    exclude_sources=sorted(deny),
                     limit=fetch_limit,
                     order_by_last_active=True,
                     compact_rows=True,

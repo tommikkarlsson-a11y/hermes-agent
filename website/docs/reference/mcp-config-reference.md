@@ -39,6 +39,9 @@ mcp_servers:
       exclude: []
       resources: true
       prompts: true
+    client_access:
+      enabled: false
+      tools: []
 ```
 
 ## Server keys
@@ -68,6 +71,7 @@ mcp_servers:
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
+| `client_access` | mapping | both | Default-off exact allowlist for trusted local clients using the `mcp.client.*` gateway RPCs. Separate from `tools.include`; globs are rejected. |
 
 ## Environment variable references
 
@@ -114,6 +118,44 @@ Any other `${...}` reference falls through to the env-var lookup above.
 | `exclude` | string or list | Blacklist server-native MCP tools. Same exact-name / glob semantics as `include` |
 | `resources` | bool-like | Enable/disable `list_resources` + `read_resource` |
 | `prompts` | bool-like | Enable/disable `list_prompts` + `get_prompt` |
+
+## Trusted local client access
+
+`client_access` exposes a narrow execution capability to trusted local UI code
+while Hermes continues to own OAuth tokens, refresh, reconnect, and MCP
+transport. It is disabled unless `enabled` is exactly `true`.
+
+```yaml
+mcp_servers:
+  example:
+    sampling:
+      enabled: false
+    elicitation:
+      enabled: false
+    client_access:
+      enabled: true
+      tools:
+        - whoami
+        - search_companies
+```
+
+Tool names are exact, case-sensitive raw MCP names. Blank values, globs,
+malformed lists, and names without exact registration-time provenance fail
+closed. `client_access.tools` does not replace `tools.include`: the latter
+controls normal registry exposure and supports globs, while the former is an
+additional exact allowlist for `mcp.client.call`.
+
+Client calls also require the exact tool's server-supplied `readOnlyHint` to be
+`true` and require both sampling and elicitation to be explicitly disabled.
+After changing those settings, reload MCP or restart the gateway so stale live
+handlers cannot remain active. This surface supports only the profile with
+which the gateway process launched; it does not switch profile homes around a
+process-global MCP runtime.
+
+OAuth tokens, authorization headers, token paths, expiry, and OAuth metadata
+remain backend-only. Write-capable tools are outside this contract. A server's
+`readOnlyHint` is defense-in-depth supplied by that server, not proof that the
+server or tool is harmless.
 
 ## Filtering semantics
 

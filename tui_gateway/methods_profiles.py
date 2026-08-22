@@ -160,9 +160,23 @@ def _(rid, params: dict) -> dict:
             try:
                 human = None
                 worker = None
-                for s in db.list_sessions_rich(
-                    source=None, limit=20, order_by_last_active=True, compact_rows=True
-                ):
+                sessions = list(
+                    db.list_sessions_rich(
+                        exclude_sources=sorted(deny),
+                        limit=1,
+                        order_by_last_active=True,
+                        compact_rows=True,
+                    )
+                )
+                sessions.extend(
+                    db.list_sessions_rich(
+                        sources=sorted(deny),
+                        limit=1,
+                        order_by_last_active=True,
+                        compact_rows=True,
+                    )
+                )
+                for s in sessions:
                     src = (s.get("source") or "").strip().lower()
                     if src in deny:
                         if worker is None:

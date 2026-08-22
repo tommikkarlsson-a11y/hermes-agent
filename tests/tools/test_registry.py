@@ -291,6 +291,30 @@ class TestToolsetAvailability:
         assert "error" in result
         assert "RuntimeError" in result["error"]
 
+    def test_handler_exception_redacts_credentials_before_logging_and_return(self, caplog):
+        reg = ToolRegistry()
+        canary = "registry-canary-4f8d2a9c7b6e5d1f"
+
+        def bad_handler(args, **kw):
+            raise RuntimeError(
+                f"upstream unavailable Bearer {canary} "
+                f"token={canary} secret={canary}; retry later"
+            )
+
+        reg.register(
+            name="bad-secret", toolset="s", schema=_make_schema(), handler=bad_handler
+        )
+        with caplog.at_level(logging.ERROR, logger="tools.registry"):
+            result = json.loads(reg.dispatch("bad-secret", {}))
+
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert canary not in logged
+        assert canary not in result["error"]
+        assert "upstream unavailable" in result["error"]
+        assert "retry later" in result["error"]
+        assert len(result["error"]) <= _MAX_TOOL_ERROR_CHARS + 200
+        assert all(len(record.getMessage()) < _MAX_LOGGED_ERROR_CHARS + 200 for record in caplog.records)
+
 
 class TestCheckFnExceptionHandling:
     """Verify that a raising check_fn is caught rather than crashing."""

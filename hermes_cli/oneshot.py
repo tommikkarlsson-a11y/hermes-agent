@@ -273,6 +273,12 @@ def run_oneshot(
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
+    previous_session_source = os.environ.get("HERMES_SESSION_SOURCE")
+    # ``-z`` is a script/pipe entrypoint, so persist its transcript as an
+    # owner-managed tool session without changing its CLI toolset or prompt
+    # semantics. The process is single-shot, but restore inherited state for
+    # direct callers and tests that invoke run_oneshot() in-process.
+    os.environ["HERMES_SESSION_SOURCE"] = "tool"
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
             try:
@@ -294,6 +300,10 @@ def run_oneshot(
                 # See #30623.
                 failure = exc
     finally:
+        if previous_session_source is None:
+            os.environ.pop("HERMES_SESSION_SOURCE", None)
+        else:
+            os.environ["HERMES_SESSION_SOURCE"] = previous_session_source
         try:
             devnull.close()
         except Exception:

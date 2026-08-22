@@ -95,6 +95,7 @@ Thread safety:
 """
 
 import asyncio
+from dataclasses import dataclass
 import contextvars
 import concurrent.futures
 import errno
@@ -4979,6 +4980,15 @@ _parallel_safe_servers: set = set()
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+
+@dataclass(frozen=True)
+class MCPToolProvenance:
+    server_name: str
+    raw_tool_name: str
+
+
+_mcp_tool_provenance: Dict[str, MCPToolProvenance] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
@@ -6656,16 +6666,46 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
-    """Remember the exact raw MCP server that registered *tool_name*."""
+def _track_mcp_tool_server(
+    tool_name: str, server_name: str, raw_tool_name: Optional[str] = None
+) -> None:
+    """Remember exact registration-time MCP identity for *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        if raw_tool_name is not None:
+            _mcp_tool_provenance[tool_name] = MCPToolProvenance(
+                server_name=server_name, raw_tool_name=raw_tool_name
+            )
+
+
+def get_mcp_tool_provenance(tool_name: str) -> Optional[MCPToolProvenance]:
+    with _lock:
+        return _mcp_tool_provenance.get(tool_name)
+
+
+def is_mcp_tool_read_only(server_name: str, raw_tool_name: str) -> bool:
+    with _lock:
+        return _tool_read_only_hints.get(server_name, {}).get(raw_tool_name) is True
+
+
+def get_mcp_client_runtime_state(server_name: str) -> dict:
+    """Return only handler-presence state needed by the client safety gate."""
+    with _lock:
+        server = _servers.get(server_name)
+        if server is None:
+            return {"live": False}
+        return {
+            "live": True,
+            "sampling_handler": getattr(server, "_sampling", None) is not None,
+            "elicitation_handler": getattr(server, "_elicitation", None) is not None,
+        }
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_provenance.pop(tool_name, None)
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -6815,6 +6855,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         candidates.append(
             {
                 "registry_name": schema["name"],
+                "raw_tool_name": mcp_tool.name,
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
@@ -6965,7 +7006,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(
+            registry_name, name, candidate.get("raw_tool_name")
+        )
         registered_names.append(registry_name)
 
     if registered_names:
@@ -7107,7 +7150,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, raw_name)
         registered_names.append(registry_name)
 
     handler_factories = {

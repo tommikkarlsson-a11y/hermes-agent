@@ -562,10 +562,10 @@ stt:
 ### 单次模式
 
 ```
-terminal(command="hermes chat -q 'Research GRPO papers and write summary to ~/research/grpo.md'", timeout=300)
+terminal(command="hermes chat --source tool -q 'Research GRPO papers and write summary to ~/research/grpo.md'", timeout=300)
 
 # 长任务后台运行：
-terminal(command="hermes chat -q 'Set up CI/CD for ~/myapp'", background=true)
+terminal(command="hermes chat --source tool -q 'Set up CI/CD for ~/myapp'", background=true)
 ```
 
 ### 交互式 PTY 模式（通过 tmux）
@@ -620,7 +620,7 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 - **快速子任务优先使用 `delegate_task`** — 比生成完整进程开销更小
 - **生成编辑代码的 agent 时使用 `-w`（worktree 模式）** — 防止 git 冲突
 - **为单次模式设置超时** — 复杂任务可能需要 5-10 分钟
-- **fire-and-forget 使用 `hermes chat -q`** — 无需 PTY
+- **agent 创建的 fire-and-forget 运行使用 `hermes chat --source tool -q "<prompt>"`** — 无需 PTY，且从正常会话树中隐藏从属 transcript
 - **交互式会话使用 tmux** — 原始 PTY 模式与 prompt_toolkit 存在 `\r` vs `\n` 问题
 - **定时任务使用 `cronjob` 工具而非生成进程** — 处理投递和重试
 

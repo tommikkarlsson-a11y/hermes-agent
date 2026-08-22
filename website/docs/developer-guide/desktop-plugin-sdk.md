@@ -591,6 +591,24 @@ listener can't affect app dispatch. Every `host` door is async-safe: a sync thro
 from an internal helper (e.g. no desktop bridge in a plain browser) becomes a
 rejection your `.catch()` sees, never an error-boundary crash.
 
+For an operator-allowlisted, read-only MCP tool, a trusted local plugin can use
+the launch-profile-only client surface without receiving OAuth credentials:
+
+```javascript
+const profile = host.state.profile.get()
+const status = await host.request('mcp.client.status', { server: 'example', profile })
+const catalog = await host.request('mcp.client.tools', { server: 'example', profile })
+const result = await host.request('mcp.client.call', {
+  server: 'example', tool: catalog.tools[0].name, arguments: {}, profile
+})
+```
+
+The server must have default-off `client_access` configured with exact raw tool
+names, explicit `sampling.enabled: false` and `elicitation.enabled: false`, and
+an exact server-supplied `readOnlyHint: true` annotation. Hermes alone owns MCP
+transport, OAuth refresh, and reconnect. The RPC never returns tokens,
+Authorization headers, token paths, expiry, or OAuth metadata.
+
 `ctx.os` is the curated OS door — every way a plugin reaches outside the app
 window, in one namespace attributed to your plugin. `ctx.os.notify` posts a
 **native OS notification** — the same Electron pipeline the app's own
@@ -865,6 +883,12 @@ agent) wrote. The optional `integrity` (`sha256-…`) check only proves the byte
 match a hash; it does **not** sandbox. A future remote-source door will need a
 real boundary (iframe/worker + CSP + capability gating) before it can land; do
 not treat this pipeline as a trust boundary.
+
+An MCP `client_access` allowlist is likewise a safety policy for trusted local
+UI code, not a sandbox against a malicious Desktop plugin with full app
+authority. `readOnlyHint` is supplied by the MCP server and is defense-in-depth,
+not proof of harmless behavior. Do not expose write-capable tools through this
+contract.
 
 ## Pitfalls
 

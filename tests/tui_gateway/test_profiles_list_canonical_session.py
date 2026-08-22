@@ -122,6 +122,26 @@ def test_canonical_session_none_when_no_bot_chat_row(home):
     assert row["last_session"]["id"] == "real1"
 
 
+def test_last_session_survives_more_than_twenty_newer_worker_sessions(home):
+    db = _db(home)
+    _add_session(db, "human1", title="Human", ts=1, text="human content")
+    for index in range(25):
+        _add_session(
+            db,
+            f"worker-{index:02d}",
+            source="kanban",
+            title=f"Worker {index}",
+            ts=1000 + index,
+            text="internal work",
+        )
+    db.close()
+
+    row = _row(_profiles({}), "default")
+
+    assert row["last_session"]["id"] == "human1"
+    assert row["worker_session"]["id"] == "worker-24"
+
+
 def test_canonical_session_denied_internal_source_returns_none(home):
     db = _db(home)
     _add_session(db, "toolrun", source="tool", title="Bot Chat", ts=1000, text="tool output")

@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_BLOCK_KINDS = {"subscription_gate"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1243,7 +1244,8 @@ class Run:
     """In-memory view of a ``task_runs`` row.
 
     A run is one attempt to execute a task — created on claim, closed
-    on complete/block/crash/timeout/spawn_failure/reclaim. Multiple runs
+    on complete/block/crash/timeout/spawn_failure/reclaim, and preserved as
+    ``invalidated`` when a controller retracts an accepted completion. Multiple runs
     per task when retries happen. Carries the claim machinery, PID,
     heartbeat, and the structured handoff summary that downstream workers
     read via ``build_worker_context``.
@@ -3179,6 +3181,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    initial_block_kind: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3235,6 +3238,12 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if initial_block_kind is not None:
+        if initial_status != "blocked" or initial_block_kind not in VALID_INITIAL_BLOCK_KINDS:
+            raise ValueError(
+                "initial_block_kind requires initial_status='blocked' and must be "
+                f"one of {sorted(VALID_INITIAL_BLOCK_KINDS)}"
+            )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3438,6 +3447,19 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # Close the cross-connection race left by the optimistic fast
+                # path above. BEGIN IMMEDIATE serializes writers, so a creator
+                # that lost the race observes and returns the winner here
+                # instead of inserting a second active task with the same key.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3497,8 +3519,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3546,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        initial_block_kind,
                     ),
                 )
                 for pid in parents:
@@ -3550,6 +3573,7 @@ def create_task(
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "block_kind": initial_block_kind,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
@@ -6249,6 +6273,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    input_request: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -6282,6 +6307,15 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if input_request is not None:
+        if kind != "needs_input" or not isinstance(input_request, dict):
+            raise ValueError("input_request is valid only for kind='needs_input' and must be an object")
+        try:
+            input_request = json.loads(
+                json.dumps(input_request, ensure_ascii=False, allow_nan=False)
+            )
+        except (TypeError, ValueError):
+            raise ValueError("input_request must contain finite JSON values") from None
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6396,6 +6430,7 @@ def block_task(
                 {
                     "reason": reason,
                     "kind": kind,
+                    "input_request": input_request,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
@@ -6454,6 +6489,7 @@ def block_task(
                 {
                     "reason": reason,
                     "kind": kind,
+                    "input_request": input_request,
                     "recurrences": recurrences,
                     "source_status": source_status,
                 },
@@ -6887,6 +6923,33 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def release_subscription_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Release only the fixed pre-dispatch Slack subscription gate.
+
+    The compare-and-swap on both status and block kind prevents a stale intake
+    read from releasing a later worker-authored block on the same idempotent
+    task. Parent dependencies are re-evaluated inside the same transaction.
+    """
+    with write_txn(conn):
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, block_kind = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "current_run_id = NULL "
+            "WHERE id = ? AND status = 'blocked' AND block_kind = 'subscription_gate'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "subscription_gate_released",
+            {"status": new_status},
+        )
+        return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -7014,6 +7077,218 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             payload if payload != {"status": "ready"} else None,
         )
         return True
+
+
+def invalidate_completed_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    superseded_run_id: int,
+    reason: str,
+    author: str,
+) -> dict[str, Any]:
+    """Invalidate one exact accepted completion from a controller context.
+
+    This is deliberately narrower than a generic task reopen. The task must be
+    currently ``done`` and ``superseded_run_id`` must name that task's latest
+    accepted ``status=done/outcome=completed`` run. The accepted task result is
+    cleared while the run's summary and metadata remain on the now-invalidated
+    audit row. Descendant re-gating composes into the same transaction; running
+    descendant workers are terminated only after commit.
+
+    Dispatcher workers are denied at this domain boundary so importing the DB
+    module or shelling around the CLI cannot turn the controller operation into
+    a worker escape hatch.
+    """
+    worker_identity = next(
+        (
+            name
+            for name in (
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK",
+                "HERMES_KANBAN_WORKSPACE",
+            )
+            if os.environ.get(name)
+        ),
+        None,
+    )
+    if worker_identity is not None:
+        raise RuntimeError(
+            "invalidate-completion is controller-only; dispatcher-worker "
+            f"identity {worker_identity} is present"
+        )
+
+    redacted_reason = str(redact_review_value(reason or "")).strip()
+    if not redacted_reason:
+        raise ValueError("reason is required")
+    trusted_author = str(author or "").strip()
+    if not trusted_author:
+        raise ValueError("author is required")
+    try:
+        requested_run_id = int(superseded_run_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("superseded_run_id must be an integer") from exc
+    if requested_run_id <= 0:
+        raise ValueError("superseded_run_id must be positive")
+
+    now = int(time.time())
+    descendant_result: dict[str, Any]
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task_row is None:
+            raise ValueError(f"task {task_id} was not found")
+        if task_row["status"] != "done":
+            raise ValueError(f"task {task_id} is not currently done")
+
+        requested_run = conn.execute(
+            "SELECT task_id, status, outcome FROM task_runs WHERE id = ?",
+            (requested_run_id,),
+        ).fetchone()
+        if requested_run is None:
+            raise ValueError(f"run {requested_run_id} was not found")
+        if requested_run["task_id"] != task_id:
+            raise ValueError(
+                f"run {requested_run_id} does not belong to task {task_id}"
+            )
+        if (
+            requested_run["status"] != "done"
+            or requested_run["outcome"] != "completed"
+        ):
+            raise ValueError(
+                f"run {requested_run_id} is not an accepted completed run"
+            )
+
+        latest_accepted = conn.execute(
+            """
+            SELECT id FROM task_runs
+             WHERE task_id = ?
+               AND status = 'done'
+               AND outcome = 'completed'
+             ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if latest_accepted is None:
+            raise ValueError(f"task {task_id} has no accepted completed run")
+        latest_run_id = int(latest_accepted["id"])
+        if latest_run_id != requested_run_id:
+            raise ValueError(
+                f"run {requested_run_id} is not the latest accepted completed "
+                f"run for task {task_id} (latest is {latest_run_id})"
+            )
+
+        task_update = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   result = NULL,
+                   completed_at = NULL,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   current_run_id = NULL,
+                   block_kind = 'needs_input',
+                   block_recurrences = 0
+             WHERE id = ? AND status = 'done'
+            """,
+            (task_id,),
+        )
+        if task_update.rowcount != 1:
+            raise RuntimeError(
+                f"task {task_id} changed before its completion could be invalidated"
+            )
+        run_update = conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'invalidated', outcome = 'invalidated'
+             WHERE id = ? AND task_id = ?
+               AND status = 'done' AND outcome = 'completed'
+            """,
+            (requested_run_id, task_id),
+        )
+        if run_update.rowcount != 1:
+            raise RuntimeError(
+                f"run {requested_run_id} changed before it could be invalidated"
+            )
+
+        payload = {
+            "prior_status": "done",
+            "new_status": "blocked",
+            "superseded_run_id": requested_run_id,
+            "reason": redacted_reason,
+            "author": trusted_author,
+        }
+        _append_event(
+            conn,
+            task_id,
+            "completion_invalidated",
+            payload,
+            run_id=requested_run_id,
+        )
+        # ``recompute_ready`` distinguishes deliberate sticky blocks from
+        # circuit-breaker blocks by the latest blocked/unblocked event, not by
+        # ``tasks.block_kind`` alone.  Emit the canonical blocked event in the
+        # same transaction so the fail-closed landing cannot be promoted and
+        # dispatched on the next gateway tick.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": redacted_reason,
+                "kind": "needs_input",
+                "recurrences": 0,
+                "source_status": "ready",
+                "superseded_run_id": requested_run_id,
+            },
+            run_id=requested_run_id,
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                trusted_author,
+                (
+                    f"COMPLETION INVALIDATED: run {requested_run_id} was "
+                    f"superseded; task moved from 'done' to 'blocked'. "
+                    f"Reason: {redacted_reason}"
+                ),
+                now,
+            ),
+        )
+        descendant_result = invalidate_descendants_for_parent_reopen(
+            conn,
+            task_id,
+            author=trusted_author,
+        )
+
+    termination_readback: list[dict[str, Any]] = []
+    for pid, claim_lock in descendant_result["terminations"]:
+        termination = _terminate_reclaimed_worker(pid, claim_lock)
+        termination_readback.append(
+            {
+                "worker_pid": int(pid) if pid else None,
+                "terminated": bool(termination.get("terminated")),
+            }
+        )
+
+    return {
+        "task_id": task_id,
+        "superseded_run_id": requested_run_id,
+        "status": "blocked",
+        "run_status": "invalidated",
+        "run_outcome": "invalidated",
+        "reason": redacted_reason,
+        "author": trusted_author,
+        "descendants": descendant_result["invalidated"],
+        "terminations": termination_readback,
+    }
 
 
 def invalidate_descendants_for_parent_reopen(

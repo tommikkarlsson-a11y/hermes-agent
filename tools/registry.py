@@ -19,6 +19,7 @@ import functools
 import importlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,28 @@ _MAX_TOOL_ERROR_CHARS = 2048
 _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 # Logs keep more of the body than the model sees, but still a bounded amount.
 _MAX_LOGGED_ERROR_CHARS = 8192
+_DISPATCH_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[^\s,;]+")
+_DISPATCH_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)(\b(?:access[_-]?token|auth[_-]?token|token|secret|api[_-]?key)\s*=\s*)[^\s,;]+"
+)
+
+
+def _redact_dispatch_exception(exc: BaseException) -> str:
+    """Return bounded, force-redacted exception text for logs and responses.
+
+    This is a credential-egress boundary.  Fail closed if the shared redactor
+    is unavailable; attaching ``exc_info`` to the eventual log record would
+    bypass this boundary by formatting the original exception again.
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(str(exc), force=True)
+        redacted = _DISPATCH_BEARER_RE.sub(r"\1***", redacted)
+        redacted = _DISPATCH_SECRET_ASSIGN_RE.sub(r"\1***", redacted)
+    except Exception:
+        redacted = "exception details unavailable"
+    return _bound_error_text(redacted)
 
 
 def _bound_error_text(text: str) -> str:
@@ -1152,19 +1175,17 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
-            # exc_info already renders the exception, so keep the message copy bounded.
-            logger.exception(
-                "Tool %s dispatch error: %s", name, _bound_error_text(str(e))
-            )
+            safe_error = _redact_dispatch_exception(e)
+            logger.error("Tool %s dispatch error: %s", name, safe_error)
             # Route through the sanitizer so framing tokens / CDATA / fences
             # in exception strings don't reach the model as structural noise.
             # See model_tools._sanitize_tool_error for rationale.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+            raw = f"Tool execution failed: {type(e).__name__}: {safe_error}"
             try:
                 from model_tools import _sanitize_tool_error
                 sanitized = _sanitize_tool_error(raw)
             except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
+                sanitized = "Tool execution failed: exception details unavailable"
             return tool_error(sanitized)
 
     # ------------------------------------------------------------------
