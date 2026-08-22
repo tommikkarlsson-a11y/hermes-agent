@@ -7168,6 +7168,24 @@ def invalidate_completed_task(
             payload,
             run_id=requested_run_id,
         )
+        # ``recompute_ready`` distinguishes deliberate sticky blocks from
+        # circuit-breaker blocks by the latest blocked/unblocked event, not by
+        # ``tasks.block_kind`` alone.  Emit the canonical blocked event in the
+        # same transaction so the fail-closed landing cannot be promoted and
+        # dispatched on the next gateway tick.
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": redacted_reason,
+                "kind": "needs_input",
+                "recurrences": 0,
+                "source_status": "ready",
+                "superseded_run_id": requested_run_id,
+            },
+            run_id=requested_run_id,
+        )
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",

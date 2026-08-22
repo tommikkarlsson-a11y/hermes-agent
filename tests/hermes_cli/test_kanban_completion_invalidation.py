@@ -127,6 +127,23 @@ def test_exact_run_invalidation_clears_acceptance_but_preserves_history(
             f"false completion; leaked credential {secret}"
         )
 
+        blocked = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "blocked"
+        ]
+        assert len(blocked) == 1
+        assert blocked[0].run_id == run_id
+        assert blocked[0].payload == {
+            "reason": payload["reason"],
+            "kind": "needs_input",
+            "recurrences": 0,
+            "source_status": "ready",
+            "superseded_run_id": run_id,
+        }
+        assert kb.recompute_ready(conn) == 0
+        sticky_task = kb.get_task(conn, task_id)
+        assert sticky_task is not None and sticky_task.status == "blocked"
+
         comments = kb.list_comments(conn, task_id)
         operator_comment = comments[-1]
         assert operator_comment.author == "controller"
