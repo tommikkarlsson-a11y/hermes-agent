@@ -154,27 +154,31 @@ def _(rid, params: dict) -> dict:
             deny = frozenset({"cron", "kanban", "subagent", "tool"})
             db = SessionDB(db_path=db_path)
             try:
-                human = None
-                worker = None
-                for s in db.list_sessions_rich(
-                    source=None,
-                    limit=20,
+                source_filter = sorted(deny)
+                human_rows = db.list_sessions_rich(
+                    exclude_sources=source_filter,
+                    limit=1,
                     order_by_last_active=True,
                     compact_rows=True,
-                    include_hidden=True,
-                ):
-                    src = (s.get("source") or "").strip().lower()
-                    if src in deny:
-                        if worker is None:
-                            worker = {
-                                "id": s["id"],
-                                "source": src,
-                                "title": s.get("title") or "",
-                                "last_active": s.get("last_active") or s.get("started_at") or 0,
-                            }
-                        continue
-                    if human is not None:
-                        continue
+                )
+                worker_rows = db.list_sessions_rich(
+                    sources=source_filter,
+                    limit=1,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                )
+                worker = None
+                if worker_rows:
+                    s = worker_rows[0]
+                    worker = {
+                        "id": s["id"],
+                        "source": (s.get("source") or "").strip().lower(),
+                        "title": s.get("title") or "",
+                        "last_active": s.get("last_active") or s.get("started_at") or 0,
+                    }
+                human = None
+                if human_rows:
+                    s = human_rows[0]
                     row = {
                         "id": s["id"],
                         "title": s.get("title") or "",
@@ -194,8 +198,6 @@ def _(rid, params: dict) -> dict:
                     except Exception:
                         pass
                     human = row
-                    if worker is not None:
-                        break
                 return human, worker
             finally:
                 try:
