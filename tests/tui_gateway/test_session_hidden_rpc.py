@@ -32,8 +32,8 @@ def _call(method: str, params: dict) -> dict:
     return srv._methods[method](1, params)
 
 
-def _seed(db, sid: str) -> None:
-    db.create_session(sid, source="desktop")
+def _seed(db, sid: str, *, source: str = "desktop") -> None:
+    db.create_session(sid, source=source)
     db._conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", (sid,))
     db._conn.commit()
 
@@ -69,3 +69,38 @@ def test_session_list_include_hidden(db):
 
     all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
     assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
+
+
+def test_global_list_keeps_user_and_bot_chat_but_drops_all_worker_sources(db):
+    _seed(db, "user")
+    _seed(db, "bot-chat")
+    db.set_session_title("bot-chat", "Bot Chat")
+    for source in ("subagent", "kanban", "tool", "cron"):
+        _seed(db, f"worker-{source}", source=source)
+
+    rows = _call("session.list", {})["result"]["sessions"]
+
+    assert {row["id"] for row in rows} == {"user", "bot-chat"}
+
+
+def test_pending_hidden_is_persisted_in_the_create_statement(db, monkeypatch):
+    def _post_insert_hide(*_args, **_kwargs):
+        raise AssertionError("hidden must not require a post-insert update")
+
+    monkeypatch.setattr(db, "set_session_hidden", _post_insert_hide)
+    session = {
+        "session_key": "atomic-hidden",
+        "profile_home": None,
+        "model_override": {},
+        "create_reasoning_override": None,
+        "create_service_tier_override": None,
+        "parent_session_id": None,
+        "source": "desktop",
+        "explicit_cwd": False,
+        "cwd": None,
+        "pending_hidden": True,
+    }
+
+    srv._ensure_session_db_row(session)
+
+    assert db.get_session("atomic-hidden")["hidden"] == 1

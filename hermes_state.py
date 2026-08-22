@@ -94,6 +94,15 @@ logger = logging.getLogger(__name__)
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
+# These sessions are implementation runs owned by another surface, not user
+# conversations. Their transcripts remain addressable by id and through
+# include_hidden owner queries, but they must never enter global recents.
+OWNER_MANAGED_SESSION_SOURCES = frozenset({"subagent", "kanban", "tool", "cron"})
+
+
+def is_owner_managed_session_source(source: Optional[str]) -> bool:
+    return str(source or "").strip().lower() in OWNER_MANAGED_SESSION_SOURCES
+
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
     """Resolve a transcript safety limit from config at call time.
@@ -4537,6 +4546,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
+        hidden: Optional[bool] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -4573,6 +4583,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
         """
+        # Source ownership is authoritative: callers may explicitly hide an
+        # ordinary session, but they may not make an owner-managed worker
+        # globally visible. Compute this before the INSERT so the first durable
+        # row is already hidden — no observable create-then-update window.
+        initial_hidden = bool(hidden) or is_owner_managed_session_source(source)
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
@@ -4580,9 +4596,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
                    model, model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd, profile_name, git_repo_root,
-                   origin_json, display_name, started_at
+                   origin_json, display_name, hidden, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = CASE
@@ -4623,7 +4639,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
                        git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root),
                        origin_json = COALESCE(sessions.origin_json, excluded.origin_json),
-                       display_name = COALESCE(sessions.display_name, excluded.display_name)""",
+                       display_name = COALESCE(sessions.display_name, excluded.display_name),
+                       hidden = MAX(sessions.hidden, excluded.hidden)""",
                 (
                     session_id,
                     source,
@@ -4641,6 +4658,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     git_repo_root,
                     origin_json,
                     display_name,
+                    1 if initial_hidden else 0,
                     time.time(),
                 ),
             )
@@ -8747,6 +8765,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             placeholders = ",".join("?" for _ in include_sources)
             where_clauses.append(f"s.source IN ({placeholders})")
             params.extend(include_sources)
+            # A source-scoped query is an owner query when every requested
+            # source is owner-managed. Global callers omit source and continue
+            # to exclude hidden rows by default.
+            if all(is_owner_managed_session_source(item) for item in include_sources):
+                include_hidden = True
         if session_key:
             where_clauses.append("s.session_key = ?")
             params.append(session_key)
@@ -11103,6 +11126,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        include_hidden: bool = False,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -11132,6 +11156,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             placeholders = ",".join("?" for _ in include_sources)
             where_clauses.append(f"s.source IN ({placeholders})")
             params.extend(include_sources)
+            if all(is_owner_managed_session_source(item) for item in include_sources):
+                include_hidden = True
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -11147,6 +11173,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        if not include_hidden:
+            where_clauses.append("s.hidden = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 

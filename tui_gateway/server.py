@@ -3013,6 +3013,7 @@ def _ensure_session_db_row(session: dict) -> None:
     if parent_session_id:
         model_config["_branched_from"] = parent_session_id
     try:
+        hidden_kwargs = {"hidden": True} if session.get("pending_hidden") else {}
         db.create_session(
             key,
             source=_session_source(session),
@@ -3024,15 +3025,8 @@ def _ensure_session_db_row(session: dict) -> None:
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
             profile_name=Path(profile_home).name if profile_home else None,
+            **hidden_kwargs,
         )
-        # A session can be born hidden (session.create hidden=true, or a
-        # session.set_hidden that arrived before the row existed): apply the
-        # deferred intent now that the row exists, mirroring pending_title.
-        if session.get("pending_hidden"):
-            try:
-                db.set_session_hidden(key, True)
-            except Exception:
-                logger.debug("failed to apply pending hidden flag", exc_info=True)
     except Exception as exc:
         # Disk-full is not a soft failure: if we swallow it here, prompt.submit
         # returns {"status":"streaming"} and the user's message vanishes with

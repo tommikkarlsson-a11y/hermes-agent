@@ -151,13 +151,17 @@ def _(rid, params: dict) -> dict:
                 return None, None
             from hermes_state import SessionDB
 
-            deny = frozenset({"kanban", "tool"})
+            deny = frozenset({"cron", "kanban", "subagent", "tool"})
             db = SessionDB(db_path=db_path)
             try:
                 human = None
                 worker = None
                 for s in db.list_sessions_rich(
-                    source=None, limit=20, order_by_last_active=True, compact_rows=True
+                    source=None,
+                    limit=20,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                    include_hidden=True,
                 ):
                     src = (s.get("source") or "").strip().lower()
                     if src in deny:

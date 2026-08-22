@@ -442,6 +442,8 @@ def get_profiles_sessions_sidebar(
         return rows
 
     def _slice(db, *, source=None, exclude=None, cap):
+        from hermes_state import is_owner_managed_session_source
+
         return db.list_sessions_rich(
             source=source,
             exclude_sources=exclude or None,
@@ -455,6 +457,7 @@ def get_profiles_sessions_sidebar(
             # A pinned conversation must reach the sidebar even when it has
             # aged past the window — otherwise its Pinned row renders empty.
             include_pinned=True,
+            include_hidden=is_owner_managed_session_source(source),
         )
 
     for name, home in targets:
