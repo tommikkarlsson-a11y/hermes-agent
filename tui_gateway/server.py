@@ -1050,9 +1050,122 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     """
     if not session or session.get("_finalized"):
         return False
-    if session.get("running"):
+    if session.get("running") or session.get("_kanban_dispatch_pending"):
         return False
     return session.get("transport") is _detached_ws_transport
+
+
+_KANBAN_SESSION_LEASE_STATUSES = frozenset(
+    {"todo", "scheduled", "ready", "running", "review"}
+)
+
+
+def _session_has_pending_kanban_delivery(session: dict | None) -> bool:
+    """Keep a detached origin session alive through its first terminal delivery.
+
+    The per-session poller is the only delivery path for ``platform="tui"``
+    subscriptions.  Reaping that session while its task is still active — or
+    after a terminal event exists but before the cursor is claimed — strands the
+    notification until a later manual resume.  This probe is read-only and
+    fails closed: a transient board/DB error delays cleanup instead of destroying
+    the only return route.
+    """
+    session_key = str((session or {}).get("session_key") or "")
+    if not session_key:
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return True
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return True
+
+    seen_db_paths: set[str] = set()
+    for board_meta in boards:
+        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
+        db_path = (board_meta or {}).get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path
+                else str(_kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        try:
+            if _kb.count_notify_subs(
+                board=slug,
+                platform="tui",
+                chat_id=session_key,
+            ) == 0:
+                continue
+            conn = _kb.connect(board=slug)
+        except Exception:
+            return True
+        try:
+            for sub in _kb.list_notify_subs(conn):
+                if (sub.get("platform") or "").lower() != "tui":
+                    continue
+                if sub.get("chat_id") != session_key:
+                    continue
+                task = _kb.get_task(conn, sub["task_id"])
+                if task and getattr(task, "status", "") in _KANBAN_SESSION_LEASE_STATUSES:
+                    return True
+                _cursor, events = _kb.unseen_events_for_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    kinds=_KANBAN_NOTIFY_KINDS,
+                )
+                if events:
+                    return True
+        except Exception:
+            return True
+        finally:
+            conn.close()
+    return False
+
+
+def _session_kanban_delivery_leased(session: dict | None) -> bool:
+    """Fail-closed boundary shared by every automatic session reaper."""
+    try:
+        return _session_has_pending_kanban_delivery(session)
+    except Exception:
+        logger.debug("Kanban delivery lease probe failed; retaining session", exc_info=True)
+        return True
+
+
+def _claim_session_for_automatic_reap(
+    sid: str,
+    *,
+    predicate: Callable[[dict], bool],
+    extra_lease: Callable[[dict], bool] | None = None,
+) -> tuple[dict | None, bool]:
+    """Atomically claim an automatic reap without crossing a Kanban handoff.
+
+    Returns ``(session, retained)``. Explicit user closes intentionally keep
+    using the ordinary close path and are not blocked by background work.
+    """
+    with _session_resume_lock:
+        current = _sessions.get(sid)
+        if current is None:
+            return None, False
+        history_lock = current.get("history_lock")
+        if history_lock is None:
+            history_lock = contextlib.nullcontext()
+        with history_lock:
+            if not predicate(current):
+                return None, False
+            if (extra_lease and extra_lease(current)) or _session_kanban_delivery_leased(current):
+                return None, True
+            return _pop_session_by_id(sid), False
 
 
 def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
@@ -1140,6 +1253,17 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
     if _WS_ORPHAN_REAP_GRACE_S <= 0:
         return
 
+    # One generation per session: rapid disconnect/reconnect/detach cycles may
+    # schedule several timers, but only the newest callback may reap or
+    # reschedule. Without this fence every active Kanban lease could grow an
+    # independent 20-second timer chain.
+    with _sessions_lock:
+        scheduled_session = _sessions.get(sid)
+        if scheduled_session is None:
+            return
+        generation = int(scheduled_session.get("_ws_orphan_reap_generation", 0)) + 1
+        scheduled_session["_ws_orphan_reap_generation"] = generation
+
     def _reap() -> None:
         # Serialize the orphan re-check against session.resume (which re-binds a
         # live transport under _session_resume_lock and would make this session
@@ -1151,17 +1275,15 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # mutual exclusion against _init_session / _close_session_by_id, which
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
-        reschedule = False
-        session = None
-        with _session_resume_lock:
-            current = _sessions.get(sid)
-            if not _ws_session_is_orphaned(current):
-                return
-            if _session_has_active_delegations(sid, current):
-                reschedule = True
-            else:
-                session = _pop_session_by_id(sid)
-        if reschedule:
+        session, retained = _claim_session_for_automatic_reap(
+            sid,
+            predicate=lambda current: (
+                current.get("_ws_orphan_reap_generation") == generation
+                and _ws_session_is_orphaned(current)
+            ),
+            extra_lease=lambda current: _session_has_active_delegations(sid, current),
+        )
+        if retained:
             _schedule_ws_orphan_reap(sid)
             return
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
@@ -1262,13 +1384,13 @@ def _reap_idle_sessions() -> None:
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
     for sid in victims:
-        _close_session_by_id(
+        session, _retained = _claim_session_for_automatic_reap(
             sid,
-            end_reason="idle_timeout",
-            predicate=lambda session, victim_sid=sid: _session_is_evictable(
-                victim_sid, session, time.time()
+            predicate=lambda current, victim_sid=sid: _session_is_evictable(
+                victim_sid, current, time.time()
             ),
         )
+        _teardown_popped_session(session, end_reason="idle_timeout")
     _enforce_session_cap()
     _reclaim_orphaned_leases()
     # Periodic heap release for long-lived gateway processes.  Even when no
@@ -1312,7 +1434,7 @@ def _reclaim_orphaned_leases() -> None:
 # DETACHED sessions sooner so live agents don't pile up under memory pressure.
 # Default-on but provably safe: it only touches sessions with no live client
 # (reopening re-resumes them from the DB) and never a running / pending /
-# mid-build / live-transport one. 0/null disables.
+# mid-build / live-transport / Kanban-delivery-leased one. 0/null disables.
 def _max_live_sessions() -> int:
     try:
         from hermes_cli.active_sessions import coerce_max_concurrent_sessions
@@ -1362,13 +1484,13 @@ def _enforce_session_cap() -> None:
         with _sessions_lock:
             if len(_sessions) <= cap:
                 break
-        _close_session_by_id(
+        session, _retained = _claim_session_for_automatic_reap(
             sid,
-            end_reason="lru_evict",
-            predicate=lambda session, victim_sid=sid: _session_is_lru_evictable(
-                victim_sid, session
+            predicate=lambda current, victim_sid=sid: _session_is_lru_evictable(
+                victim_sid, current
             ),
         )
+        _teardown_popped_session(session, end_reason="lru_evict")
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -10123,8 +10245,12 @@ def _notification_poller_loop(
                 )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
+            with session["history_lock"]:
+                session["_kanban_dispatch_pending"] = True
+            _kanban_collection_ok = False
             try:
                 _kanban_texts = _collect_kanban_notifications(session)
+                _kanban_collection_ok = True
             except Exception as _kb_exc:
                 print(
                     f"[tui_gateway] kanban notification poll failed: "
@@ -10135,30 +10261,38 @@ def _notification_poller_loop(
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
-            _pending = session.get("_kanban_pending") or []
-            if _pending:
-                _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
-                if _batch:
-                    rid = f"__notif__{int(time.time() * 1000)}"
-                    try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
-                    except Exception as exc:
-                        print(
-                            f"[tui_gateway] kanban notification dispatch failed: "
-                            f"{type(exc).__name__}: {exc}",
-                            file=sys.stderr,
-                        )
-                        with session["history_lock"]:
-                            session["running"] = False
+            _batch: list = []
+            with session["history_lock"]:
+                if _kanban_texts:
+                    # Events are cursor-claimed (never re-queued), so buffer
+                    # them until the session is idle instead of dropping the
+                    # agent turn.
+                    session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+                _pending = session.get("_kanban_pending") or []
+                if _pending and not session.get("running"):
+                    session["running"] = True
+                    _batch = list(_pending)
+                    session["_kanban_pending"] = []
+                    session.pop("_kanban_dispatch_pending", None)
+                elif not _pending and _kanban_collection_ok:
+                    session.pop("_kanban_dispatch_pending", None)
+                # If pending remains behind a busy turn, or collection failed
+                # after a cursor claim, retain the handoff flag. The orphan
+                # reaper must fail closed until a later successful poll either
+                # dispatches the batch or proves there is nothing to deliver.
+            if _batch:
+                rid = f"__notif__{int(time.time() * 1000)}"
+                try:
+                    _emit("message.start", sid)
+                    _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                except Exception as exc:
+                    print(
+                        f"[tui_gateway] kanban notification dispatch failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    with session["history_lock"]:
+                        session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:

@@ -18,6 +18,8 @@ from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
     _collect_kanban_notifications,
     _format_kanban_event_text,
+    _session_has_pending_kanban_delivery,
+    _ws_session_is_orphaned,
 )
 
 SESSION_KEY = "tui-session-key-1"
@@ -190,6 +192,294 @@ class TestCollectKanbanNotifications:
         assert _collect_kanban_notifications({"session_key": ""}) == []
         assert _collect_kanban_notifications({"session_key": None}) == []
         assert len(_sub_rows(tid)) == 1
+
+
+class TestKanbanDeliveryLease:
+    def test_no_matching_subscription_does_not_lease_session(self):
+        assert _session_has_pending_kanban_delivery(_session()) is False
+
+    def test_scheduled_subscription_leases_session(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,)
+                )
+        finally:
+            conn.close()
+
+        assert _session_has_pending_kanban_delivery(_session()) is True
+
+    def test_unseen_completion_leases_until_cursor_is_claimed(self):
+        tid = _create_subscribed_task()
+        _complete(tid)
+
+        assert _session_has_pending_kanban_delivery(_session()) is True
+        assert _collect_kanban_notifications(_session())
+        assert _session_has_pending_kanban_delivery(_session()) is False
+
+    def test_board_probe_failure_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(kb, "list_boards", lambda **_kwargs: (_ for _ in ()).throw(OSError("db unavailable")))
+
+        assert _session_has_pending_kanban_delivery(_session()) is True
+
+    def test_claim_handoff_flag_prevents_orphan_reap(self):
+        import tui_gateway.server as server
+
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "_kanban_dispatch_pending": True,
+        }
+
+        assert _ws_session_is_orphaned(session) is False
+
+        session.pop("_kanban_dispatch_pending")
+        assert _ws_session_is_orphaned(session) is True
+
+    def test_orphan_reap_waits_for_delivery_then_releases(self, monkeypatch):
+        import threading
+        import time
+        import tui_gateway.server as server
+
+        tid = _create_subscribed_task()
+        sid = "kanban-lease-reap-test"
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": threading.Lock(),
+        }
+        torn_down: list[str] = []
+        monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+        monkeypatch.setattr(
+            server,
+            "_teardown_popped_session",
+            lambda _session, *, end_reason: torn_down.append(end_reason),
+        )
+        with server._sessions_lock:
+            server._sessions[sid] = session
+        try:
+            server._schedule_ws_orphan_reap(sid)
+            time.sleep(0.05)
+            with server._sessions_lock:
+                assert server._sessions.get(sid) is session
+            assert torn_down == []
+
+            _complete(tid)
+            assert _collect_kanban_notifications(session)
+
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                with server._sessions_lock:
+                    if sid not in server._sessions:
+                        break
+                time.sleep(0.01)
+            with server._sessions_lock:
+                assert sid not in server._sessions
+            assert torn_down == ["ws_orphan_reap"]
+        finally:
+            with server._sessions_lock:
+                server._sessions.pop(sid, None)
+
+    def test_handoff_publication_wins_race_with_final_reap_claim(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        callbacks: list = []
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                callbacks.append(callback)
+
+            def start(self):
+                return None
+
+        sid = "kanban-handoff-race-test"
+        history_lock = threading.Lock()
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": history_lock,
+        }
+        monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+        monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_args: False)
+        monkeypatch.setattr(server, "_session_kanban_delivery_leased", lambda _session: False)
+        with server._sessions_lock:
+            server._sessions[sid] = session
+        try:
+            server._schedule_ws_orphan_reap(sid)
+            with history_lock:
+                reaper = threading.Thread(target=callbacks[0])
+                reaper.start()
+                session["_kanban_dispatch_pending"] = True
+            reaper.join(timeout=1)
+            assert not reaper.is_alive()
+            with server._sessions_lock:
+                assert server._sessions.get(sid) is session
+        finally:
+            with server._sessions_lock:
+                server._sessions.pop(sid, None)
+
+    def test_probe_exception_retains_and_schedules_one_retry(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        callbacks: list = []
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                callbacks.append(callback)
+
+            def start(self):
+                return None
+
+        sid = "kanban-probe-retry-test"
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": threading.Lock(),
+        }
+        monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+        monkeypatch.setattr(
+            server,
+            "_session_has_pending_kanban_delivery",
+            lambda _session: (_ for _ in ()).throw(RuntimeError("probe failed")),
+        )
+        with server._sessions_lock:
+            server._sessions[sid] = session
+        try:
+            server._schedule_ws_orphan_reap(sid)
+            callbacks[0]()
+            with server._sessions_lock:
+                assert server._sessions.get(sid) is session
+            assert len(callbacks) == 2
+        finally:
+            with server._sessions_lock:
+                server._sessions.pop(sid, None)
+
+    def test_only_latest_orphan_timer_generation_can_reap(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        callbacks: list = []
+        torn_down: list[str] = []
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                callbacks.append(callback)
+
+            def start(self):
+                return None
+
+        sid = "kanban-reap-generation-test"
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": threading.Lock(),
+        }
+        monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+        monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+        monkeypatch.setattr(server, "_session_kanban_delivery_leased", lambda _session: False)
+        monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_args: False)
+        monkeypatch.setattr(
+            server,
+            "_teardown_popped_session",
+            lambda claimed, *, end_reason: torn_down.append(end_reason)
+            if claimed is not None
+            else None,
+        )
+        with server._sessions_lock:
+            server._sessions[sid] = session
+        try:
+            server._schedule_ws_orphan_reap(sid)
+            server._schedule_ws_orphan_reap(sid)
+            callbacks[0]()
+            with server._sessions_lock:
+                assert server._sessions.get(sid) is session
+            callbacks[1]()
+            with server._sessions_lock:
+                assert sid not in server._sessions
+            assert torn_down == ["ws_orphan_reap"]
+        finally:
+            with server._sessions_lock:
+                server._sessions.pop(sid, None)
+
+    def test_idle_ttl_reaper_honors_kanban_lease(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        sid = "kanban-ttl-lease-test"
+        session = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": threading.Lock(),
+            "created_at": 0.0,
+            "last_active": 0.0,
+        }
+        monkeypatch.setattr(server, "_SESSION_TTL_S", 0.0)
+        monkeypatch.setattr(
+            server, "_session_kanban_delivery_leased", lambda current: current is session
+        )
+        monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
+        monkeypatch.setattr(server, "_reclaim_orphaned_leases", lambda: None)
+        with server._sessions_lock:
+            server._sessions[sid] = session
+        try:
+            server._reap_idle_sessions()
+            with server._sessions_lock:
+                assert server._sessions.get(sid) is session
+        finally:
+            with server._sessions_lock:
+                server._sessions.pop(sid, None)
+
+    def test_lru_reaper_honors_kanban_lease(self, monkeypatch):
+        import threading
+        import tui_gateway.server as server
+
+        leased_sid = "kanban-lru-lease-test"
+        live_sid = "kanban-lru-live-test"
+        leased = {
+            "session_key": SESSION_KEY,
+            "transport": server._detached_ws_transport,
+            "running": False,
+            "history_lock": threading.Lock(),
+            "created_at": 0.0,
+            "last_active": 0.0,
+        }
+        live = {
+            "session_key": "live-session",
+            "transport": object(),
+            "running": False,
+            "history_lock": threading.Lock(),
+            "created_at": 1.0,
+            "last_active": 1.0,
+        }
+        monkeypatch.setattr(server, "_max_live_sessions", lambda: 1)
+        monkeypatch.setattr(
+            server, "_session_kanban_delivery_leased", lambda current: current is leased
+        )
+        with server._sessions_lock:
+            original = dict(server._sessions)
+            server._sessions.clear()
+            server._sessions.update({leased_sid: leased, live_sid: live})
+        try:
+            server._enforce_session_cap()
+            with server._sessions_lock:
+                assert server._sessions.get(leased_sid) is leased
+                assert server._sessions.get(live_sid) is live
+        finally:
+            with server._sessions_lock:
+                server._sessions.clear()
+                server._sessions.update(original)
 
     def test_profile_scoped_session_reads_the_shared_board(self, tmp_path):
         """The kanban board is shared across profiles BY DESIGN (see the

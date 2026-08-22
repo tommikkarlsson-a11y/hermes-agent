@@ -132,6 +132,135 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def _set_task_body(task_id, body):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (body, task_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _valid_bot_handoff():
+    return {
+        "schema": "bot-handoff/v1",
+        "outcome": "Validated the bounded cross-bot mission handoff.",
+        "evidence_refs": ["audit/contract.json", "tests/tools/test_kanban_tools.py"],
+        "facts": {"tests_passed": 4, "legacy_compatible": True},
+        "next": {
+            "owner": "personal",
+            "action": "Accept the cross-role interface.",
+            "stop_condition": "Architecture acceptance is recorded.",
+        },
+    }
+
+
+def test_declared_bot_handoff_is_persisted_and_reaches_child_context(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _set_task_body(worker_env, "Mission\n\nHandoff schema: bot-handoff/v1\n")
+    handoff = _valid_bot_handoff()
+    completed = json.loads(
+        kt._handle_complete(
+            {"summary": "mission complete", "metadata": {"handoff": handoff}}
+        )
+    )
+    assert completed["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata["handoff"] == handoff
+        child = kb.create_task(
+            conn, title="downstream", assignee="next-worker", parents=[worker_env]
+        )
+        context = kb.build_worker_context(conn, child)
+    finally:
+        conn.close()
+
+    canonical = json.dumps({"handoff": handoff}, ensure_ascii=False, sort_keys=True)
+    assert f"_metadata_: `{canonical}`" in context
+
+
+def test_declared_bot_handoff_is_required_before_completion_write(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _set_task_body(worker_env, "Handoff schema: bot-handoff/v1")
+    rejected = json.loads(kt._handle_complete({"summary": "missing envelope"}))
+    assert "metadata.handoff is required" in rejected["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+        assert not any(event.kind == "completed" for event in kb.list_events(conn, worker_env))
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "handoff,error_fragment",
+    [
+        ({}, "missing required fields"),
+        ({**_valid_bot_handoff(), "schema": "bot-handoff/v2"}, "schema must equal"),
+        ({**_valid_bot_handoff(), "outcome": "  "}, "outcome must be"),
+        ({**_valid_bot_handoff(), "evidence_refs": []}, "evidence_refs must be"),
+        ({**_valid_bot_handoff(), "evidence_refs": [""]}, "evidence_refs must be"),
+        ({**_valid_bot_handoff(), "facts": []}, "facts must be an object"),
+        ({**_valid_bot_handoff(), "next": {"owner": "ops"}}, "next must contain exactly"),
+        ({**_valid_bot_handoff(), "extra": True}, "unsupported fields"),
+    ],
+)
+def test_declared_malformed_bot_handoff_is_rejected_without_completion(
+    worker_env, handoff, error_fragment
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _set_task_body(worker_env, "Handoff schema: bot-handoff/v1")
+    rejected = json.loads(
+        kt._handle_complete(
+            {"summary": "bad envelope", "metadata": {"handoff": handoff}}
+        )
+    )
+    assert error_fragment in rejected["error"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_undeclared_voluntary_bot_handoff_is_validated(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(
+        kt._handle_complete(
+            {
+                "summary": "voluntary but malformed",
+                "metadata": {"handoff": {"schema": "bot-handoff/v1"}},
+            }
+        )
+    )
+    assert "missing required fields" in rejected["error"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

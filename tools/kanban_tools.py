@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+_BOT_HANDOFF_SCHEMA = "bot-handoff/v1"
+_BOT_HANDOFF_DECLARATION = f"Handoff schema: {_BOT_HANDOFF_SCHEMA}"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -178,6 +180,70 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+def _bot_handoff_validation_error(task: Any, metadata: Optional[dict]) -> Optional[str]:
+    """Validate the opt-in cross-bot completion envelope.
+
+    The declaration is intentionally an exact standalone body line. Ordinary
+    cards remain schema-free, but a voluntarily supplied ``metadata.handoff``
+    is still validated so malformed envelopes cannot enter the durable handoff
+    path accidentally.
+    """
+    body = str(getattr(task, "body", None) or "")
+    declared = _BOT_HANDOFF_DECLARATION in body.splitlines()
+    supplied = isinstance(metadata, dict) and "handoff" in metadata
+    if not declared and not supplied:
+        return None
+    if not supplied:
+        return (
+            f"task declares {_BOT_HANDOFF_DECLARATION!r}; "
+            "metadata.handoff is required"
+        )
+
+    assert isinstance(metadata, dict)
+    handoff = metadata.get("handoff")
+    if not isinstance(handoff, dict):
+        return "metadata.handoff must be an object"
+
+    allowed = {"schema", "outcome", "evidence_refs", "facts", "next"}
+    unknown = sorted(set(handoff) - allowed)
+    if unknown:
+        return f"metadata.handoff has unsupported fields: {', '.join(unknown)}"
+    missing = sorted({"schema", "outcome", "evidence_refs", "facts"} - set(handoff))
+    if missing:
+        return f"metadata.handoff is missing required fields: {', '.join(missing)}"
+    if handoff.get("schema") != _BOT_HANDOFF_SCHEMA:
+        return f"metadata.handoff.schema must equal {_BOT_HANDOFF_SCHEMA!r}"
+    if not isinstance(handoff.get("outcome"), str) or not handoff["outcome"].strip():
+        return "metadata.handoff.outcome must be a non-empty string"
+
+    refs = handoff.get("evidence_refs")
+    if (
+        not isinstance(refs, list)
+        or not refs
+        or any(not isinstance(ref, str) or not ref.strip() for ref in refs)
+    ):
+        return "metadata.handoff.evidence_refs must be a non-empty array of non-empty strings"
+    if not isinstance(handoff.get("facts"), dict):
+        return "metadata.handoff.facts must be an object"
+
+    if "next" in handoff:
+        next_step = handoff["next"]
+        required_next = {"owner", "action", "stop_condition"}
+        if not isinstance(next_step, dict):
+            return "metadata.handoff.next must be an object"
+        if set(next_step) != required_next:
+            return (
+                "metadata.handoff.next must contain exactly owner, action, "
+                "and stop_condition"
+            )
+        if any(
+            not isinstance(next_step[key], str) or not next_step[key].strip()
+            for key in required_next
+        ):
+            return "metadata.handoff.next fields must be non-empty strings"
+    return None
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -752,6 +818,12 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            handoff_error = _bot_handoff_validation_error(task, metadata)
+            if handoff_error is not None:
+                return tool_error(
+                    f"kanban_complete rejected {_BOT_HANDOFF_SCHEMA} handoff: "
+                    f"{handoff_error}. Your task is still in-flight (no state change)."
+                )
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),

@@ -53,6 +53,13 @@ def test_emits_for_default_when_any_profile_is_managed(tmp_path):
     assert "@default" not in section
     assert "`researcher`" in section
     assert "hermes profile list" in section
+    assert "--run-budget 300" in section
+    assert "advisory/wake-up only" in section
+    assert "request_id" in section
+    assert "at most five context bullets" in section
+    assert "STATUS=answered|blocked|needs-decision" in section
+    assert "no side effects or recursive bot chatter" in section
+    assert "that is a handoff" not in section
 
 
 def test_emits_for_named_profile_with_own_handle(tmp_path):
