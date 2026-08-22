@@ -70,6 +70,26 @@ def test_worker_session_reports_newest_worker_and_keeps_last_session_clean(home)
     assert row["last_session"]["id"] == "chat1"
 
 
+def test_worker_volume_does_not_starve_latest_human_session(home):
+    db = _db(home)
+    _add_session(db, "human1", source="desktop", title="Human", ts=1000, text="human content")
+    for index in range(25):
+        _add_session(
+            db,
+            f"worker-{index}",
+            source="tool",
+            title=f"Worker {index}",
+            ts=2000 + index,
+            text=f"worker content {index}",
+        )
+    db.close()
+
+    row = _row(_profiles({}), "default")
+
+    assert row["last_session"]["id"] == "human1"
+    assert row["worker_session"]["id"] == "worker-24"
+
+
 def test_worker_session_none_without_workers(home):
     db = _db(home)
     _add_session(db, "chat1", source="cli", title="Chat", ts=1000, text="hello")

@@ -18,25 +18,6 @@ from hermes_state import is_owner_managed_session_source
 RECEIPT_SCHEMA = "worker-session-visibility/v1"
 
 
-def _normalized_roots(roots: Iterable[str | Path]) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                str(Path(root)).rstrip("/\\")
-                for root in roots
-                if str(root).strip().rstrip("/\\")
-            }
-        )
-    )
-
-
-def _under_root(path: Optional[str], roots: tuple[str, ...]) -> bool:
-    if not path:
-        return False
-    value = str(Path(path)).rstrip("/\\")
-    return any(value == root or value.startswith(root + "/") for root in roots)
-
-
 def _delegate_marker(model_config: Optional[str]) -> bool:
     if not model_config:
         return False
@@ -97,15 +78,15 @@ def migrate_worker_session_visibility(
 ) -> dict[str, Any]:
     """Hide positively identified historical workers or roll back one receipt.
 
-    Direct worker sources, stable ``_delegate_from`` markers, and legacy CLI
-    rows beneath an explicitly supplied Kanban workspaces root are candidates.
-    Parentless child rows without one of those markers are reported as legacy
-    orphans but never guessed to be workers.
+    Direct worker sources and stable ``_delegate_from`` markers are candidates.
+    ``workspaces_roots`` remains accepted for call compatibility but cwd alone
+    is never treated as ownership evidence. Parentless child rows without an
+    authoritative marker are reported as legacy orphans, never guessed.
     """
     if rollback_receipt is not None:
         return _rollback(db, rollback_receipt)
 
-    roots = _normalized_roots(workspaces_roots)
+    _ = workspaces_roots
     with db._read_ctx() as conn:
         rows = conn.execute(
             "SELECT id, source, hidden, cwd, model_config, parent_session_id "
@@ -121,7 +102,6 @@ def migrate_worker_session_visibility(
         candidate = (
             is_owner_managed_session_source(source)
             or _delegate_marker(row["model_config"])
-            or (source == "cli" and _under_root(row["cwd"], roots))
         )
         if candidate:
             candidate_ids.append(row["id"])

@@ -56,7 +56,6 @@ def test_migration_dry_run_apply_rerun_and_rollback(db, tmp_path):
         "tool",
         "cron",
         "legacy-delegate",
-        "legacy-kanban",
     }
     assert db.get_session("subagent")["hidden"] == 0
 
@@ -67,6 +66,9 @@ def test_migration_dry_run_apply_rerun_and_rollback(db, tmp_path):
     assert all(db.get_session(sid)["hidden"] == 1 for sid in applied["changed_ids"])
     assert db.get_session("user")["hidden"] == 0
     assert db.get_session("bot")["hidden"] == 0
+    # A Kanban-looking cwd is not authoritative ownership metadata. Legacy
+    # source=cli rows stay visible unless they carry a stable delegate marker.
+    assert db.get_session("legacy-kanban")["hidden"] == 0
 
     rerun = migrate_worker_session_visibility(
         db, workspaces_roots=[workspaces], dry_run=False
