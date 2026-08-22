@@ -170,6 +170,38 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
 
 
+def test_top_level_worker_subprocess_scrubs_all_kanban_keys_without_parent_contamination(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.setenv("HERMES_KANBAN_FUTURE_AUTHORITY", "must-strip")
+    monkeypatch.delenv("HERMES_NON_DISPATCHER_CHILD", raising=False)
+    from agent.delegation_context import non_dispatcher_child_subprocess_env
+
+    child = non_dispatcher_child_subprocess_env()
+    assert child["HERMES_NON_DISPATCHER_CHILD"] == "1"
+    assert not any(key.startswith("HERMES_KANBAN_") for key in child)
+    # Building a child env is copy-only: the parent worker retains its claim.
+    assert os.environ["HERMES_KANBAN_TASK"] == "t_parent"
+    assert os.environ["HERMES_KANBAN_RUN_ID"] == "123"
+    assert os.environ["HERMES_KANBAN_FUTURE_AUTHORITY"] == "must-strip"
+    assert "HERMES_NON_DISPATCHER_CHILD" not in os.environ
+
+
+def test_general_mutation_boundary_rejects_non_dispatcher_context(monkeypatch, tmp_path):
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch, tmp_path,
+    )
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    with kb.connect() as conn, non_dispatcher_owned_context():
+        with pytest.raises(PermissionError, match="non-dispatcher child"):
+            kb.add_comment(conn, tid, "test", "forbidden")
+    with kb.connect() as conn:
+        assert kb.list_comments(conn, tid) == []
+
+
 def test_delegate_child_kanban_cli_cannot_delete_parent_board(
     monkeypatch,
     tmp_path,

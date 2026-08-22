@@ -192,35 +192,10 @@ def finalize_turn(
         final_response = agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
 
-    if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            _record_kanban_budget_exhausted(
-                _kanban_task, api_call_count, agent.max_iterations, logger,
-            )
-    elif budget_exhausted:
-        # Bounded fallback (#87096): budget was exhausted but none of the
-        # normal fallback paths were eligible (interrupted / failed /
-        # anomalous exit_reason). If running as a kanban worker we must
-        # still record a terminal outcome so the task does not remain in
-        # an ambiguous lifecycle state. The worker's run is closed via
-        # ``_record_task_failure`` (compare-and-swap receipt path) which
-        # is a no-op if another path closed it — the CAS invariant in
-        # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
-        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
-            _record_kanban_budget_exhausted(
-                _kanban_task, api_call_count, agent.max_iterations, logger,
-            )
+    # Kanban budget exhaustion is signalled to the dispatcher through the
+    # typed result + dedicated worker exit code below. The worker must not
+    # mutate/requeue its own card: only the dispatcher owns the exact-run CAS,
+    # fingerprinted one-recovery protocol, and preserved-artifact inventory.
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -726,6 +701,19 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    _kanban_iteration_exhausted = bool(
+        budget_exhausted
+        and os.environ.get("HERMES_KANBAN_TASK")
+        and not str(_turn_exit_reason).startswith("kanban_lifecycle:")
+    )
+    if _kanban_iteration_exhausted:
+        result["failed"] = True
+        result["completed"] = False
+        result["failure_reason"] = "iteration_budget_exhausted"
+        result["failure_detail"] = {
+            "used": int(api_call_count),
+            "limit": int(agent.max_iterations),
+        }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

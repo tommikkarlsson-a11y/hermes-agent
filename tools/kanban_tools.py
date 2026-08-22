@@ -1526,6 +1526,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                required_reviewer=args.get("required_reviewer"),
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -2225,6 +2226,14 @@ KANBAN_CREATE_SCHEMA = {
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
                     "Required — tasks without an assignee are never "
                     "dispatched."
+                ),
+            },
+            "required_reviewer": {
+                "type": "string",
+                "description": (
+                    "Optional exact profile required for same-card review. "
+                    "When set, the implementer cannot complete directly and "
+                    "must request review from this profile."
                 ),
             },
             "body": {

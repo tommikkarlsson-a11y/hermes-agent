@@ -21,11 +21,30 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     for prof in ("alpha", "beta", "default"):
         os.makedirs(os.path.join(test_home, "profiles", prof), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    from hermes_cli import kanban_db
-    yield kanban_db
+    module_names = [
+        name for name in sys.modules
+        if name.startswith("hermes_cli")
+        or name.startswith("hermes_state")
+        or name == "hermes_constants"
+    ]
+    saved_modules = {name: sys.modules[name] for name in module_names}
+    for name in module_names:
+        del sys.modules[name]
+    try:
+        from hermes_cli import kanban_db
+        yield kanban_db
+    finally:
+        # Collection-time imports in later test modules still reference the
+        # original module objects. Restore them so this fixture's isolated
+        # HERMES_HOME reload cannot contaminate subsequent tests in-process.
+        for name in list(sys.modules):
+            if (
+                name.startswith("hermes_cli")
+                or name.startswith("hermes_state")
+                or name == "hermes_constants"
+            ):
+                del sys.modules[name]
+        sys.modules.update(saved_modules)
 
 
 def _fake_spawn(*args, **kwargs):
@@ -96,5 +115,45 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     assert len(res2.spawned) == 1
     assert len(res2.skipped_per_profile_capped) == 1
     assert res2.spawned[0][0] != spawned_id  # different task this time
+
+
+def test_cross_board_count_caps_both_ready_and_review_lanes(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Default")
+    kb.create_board(slug="other", name="Other")
+    with kb.connect_closing(board="other") as other:
+        running = kb.create_task(other, title="running", assignee="alpha")
+        kb.claim_task(other, running)
+    with kb.connect_closing(board="default") as conn:
+        ready = kb.create_task(conn, title="ready", assignee="alpha")
+        review = kb.create_task(conn, title="review", assignee="alpha")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+        result = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=True,
+            max_in_progress=4, max_in_progress_per_profile=1,
+        )
+    assert result.spawned == []
+    assert {item[0] for item in result.skipped_per_profile_capped} == {ready, review}
+    assert all(item[2] == 1 for item in result.skipped_per_profile_capped)
+
+
+def test_running_counts_deduplicate_registry_db_paths(
+    isolated_kanban_home_with_profiles, monkeypatch,
+):
+    kb = isolated_kanban_home_with_profiles
+    kb.create_board(slug="default", name="Default")
+    with kb.connect_closing(board="default") as conn:
+        task = kb.create_task(conn, title="one", assignee="alpha")
+        kb.claim_task(conn, task)
+        db_path = kb._connection_db_path(conn)
+        monkeypatch.setattr(kb, "list_boards", lambda **_kw: [
+            {"slug": "default", "db_path": db_path},
+            {"slug": "alias", "db_path": db_path},
+        ])
+        assert kb.running_counts_all_boards(conn) == {"alpha": 1}
 
 

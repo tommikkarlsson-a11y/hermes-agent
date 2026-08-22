@@ -21373,7 +21373,13 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not (
+                                isinstance(result, dict)
+                                and result.get("failure_reason") == "iteration_budget_exhausted"
+                            )
+                        ):
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
@@ -21405,6 +21411,16 @@ def main(
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
                                     )
                                     _exit_code = _RL_CODE
+                                except Exception:
+                                    _exit_code = 1
+                            elif os.environ.get("HERMES_KANBAN_TASK") and result.get(
+                                "failure_reason"
+                            ) == "iteration_budget_exhausted":
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_ITERATION_EXHAUSTED_EXIT_CODE as _ITER_CODE,
+                                    )
+                                    _exit_code = _ITER_CODE
                                 except Exception:
                                     _exit_code = 1
                         sys.exit(_exit_code)

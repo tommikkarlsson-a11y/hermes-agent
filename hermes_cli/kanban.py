@@ -331,6 +331,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--required-reviewer", default=None,
+        help="Require same-card review by this exact profile before completion.",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1612,6 +1616,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             title=args.title,
             body=args.body,
             assignee=args.assignee,
+            required_reviewer=args.required_reviewer,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,

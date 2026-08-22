@@ -2736,6 +2736,28 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ):
             return
 
+        # Latch only an explicitly successful sole lifecycle transition, and
+        # only after its tool row is durable. Tool name alone is not success.
+        if len(assistant_message.tool_calls) == 1:
+            from agent.kanban_stop import KANBAN_LIFECYCLE_TOOLS
+            if function_name in KANBAN_LIFECYCLE_TOOLS:
+                try:
+                    lifecycle_payload = json.loads(display_function_result)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    lifecycle_payload = None
+                if (
+                    isinstance(lifecycle_payload, dict)
+                    and (
+                        lifecycle_payload.get("success") is True
+                        or lifecycle_payload.get("ok") is True
+                    )
+                    and not lifecycle_payload.get("error")
+                ):
+                    agent._kanban_lifecycle_exit_reason = (
+                        f"kanban_lifecycle:{function_name}"
+                    )
+                    return
+
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:

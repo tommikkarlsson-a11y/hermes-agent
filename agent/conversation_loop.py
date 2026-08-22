@@ -1823,6 +1823,7 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    agent._kanban_lifecycle_exit_reason = None
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
@@ -7339,6 +7340,14 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                # A successful sole lifecycle result was appended and flushed
+                # by the executor. Exit immediately: no post-completion model
+                # turn, verify nudge, goal continuation, compression, or tool.
+                if getattr(agent, "_kanban_lifecycle_exit_reason", None):
+                    _turn_exit_reason = agent._kanban_lifecycle_exit_reason
+                    final_response = ""
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

@@ -114,6 +114,59 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         assert _events(conn, tid, kind="block_loop_detected") == []
 
 
+def test_required_reviewer_forbids_implementer_completion_and_requires_exact_profile(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="mandatory review", assignee="worker",
+            required_reviewer="reviewer",
+        )
+        assert kb.get_task(conn, tid).required_reviewer == "reviewer"
+        claimed = kb.claim_task(conn, tid)
+        with pytest.raises(ValueError, match="implementer completion is forbidden"):
+            kb.complete_task(conn, tid, expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.request_review(
+            conn, tid, reviewer="wrong", expected_run_id=claimed.current_run_id,
+        ) is False
+        assert kb.request_review(
+            conn, tid, reviewer=None, expected_run_id=claimed.current_run_id,
+        ) is True
+        assert kb.get_task(conn, tid).assignee == "reviewer"
+
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.complete_task(
+            conn, tid, expected_run_id=review.current_run_id,
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_required_reviewer_completion_rejects_missing_durable_review_provenance(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="provenance", assignee="worker",
+            required_reviewer="reviewer",
+        )
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, reviewer="reviewer", expected_run_id=impl.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        conn.execute(
+            "UPDATE task_events SET payload='{}' WHERE task_id=? AND run_id=? "
+            "AND kind='claimed'",
+            (tid, review.current_run_id),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="not durably claimed from review"):
+            kb.complete_task(conn, tid, expected_run_id=review.current_run_id)
+        assert kb.get_task(conn, tid).status == "running"
+
+
 # ---------------------------------------------------------------------------
 # Core regression: repeated review requests never escalate to triage
 # ---------------------------------------------------------------------------

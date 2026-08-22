@@ -158,6 +158,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "required_reviewer" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -324,6 +325,104 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+
+
+def test_bounded_artifact_inventory_limits_and_prunes_internal_trees(tmp_path):
+    workspace = tmp_path / "inventory"
+    workspace.mkdir()
+    for name in (".git", ".venv"):
+        hidden = workspace / name
+        hidden.mkdir()
+        (hidden / "secret").write_text("do not inventory", encoding="utf-8")
+    for index in range(4):
+        (workspace / f"file-{index}.txt").write_text("x", encoding="utf-8")
+
+    full = kb._bounded_artifact_inventory(str(workspace), limit=20)
+    assert [item["path"] for item in full] == [
+        "file-0.txt", "file-1.txt", "file-2.txt", "file-3.txt",
+    ]
+    bounded = kb._bounded_artifact_inventory(str(workspace), limit=2)
+    assert bounded == [
+        {"path": "file-0.txt", "kind": "file", "size": 1},
+        {"path": "file-1.txt", "kind": "file", "size": 1},
+        {"truncated": True, "limit": 2},
+    ]
+
+
+def test_iteration_exhaustion_requeues_once_then_blocks_unchanged_contract(
+    kanban_home, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / "partial.txt").write_text("preserved", encoding="utf-8")
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="  finish   slice ", body="A\n\nB", assignee="a",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        for attempt in (1, 2):
+            pid = 71000 + attempt
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:iter{attempt}")
+            assert claimed is not None
+            conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+            conn.commit()
+            kb._record_worker_exit(
+                pid, _exited_status(kb.KANBAN_ITERATION_EXHAUSTED_EXIT_CODE)
+            )
+            assert tid not in kb.detect_crashed_workers(conn)
+            task = kb.get_task(conn, tid)
+            assert task.consecutive_failures == 0
+            assert task.status == ("ready" if attempt == 1 else "blocked")
+
+        runs = kb.list_runs(conn, tid)
+        exhausted = [run for run in runs if run.outcome == "iteration_exhausted"]
+        assert len(exhausted) == 2
+        assert exhausted[0].metadata["workspace_preserved"] is True
+        assert any(
+            item.get("path") == "partial.txt"
+            for item in exhausted[0].metadata["artifact_inventory"]
+        )
+        assert exhausted[0].metadata["fingerprint"] == exhausted[1].metadata["fingerprint"]
+        assert exhausted[0].metadata["disposition"] == "requeued_once"
+        assert exhausted[1].metadata["disposition"] == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb._block_unchanged_exhausted_contract(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # A materially narrowed contract produces a new fingerprint and may run.
+        assert kb.unblock_task(conn, tid)
+        conn.execute("UPDATE tasks SET body='only missing B' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb._block_unchanged_exhausted_contract(conn, tid) is False
+
+
+def test_iteration_exhaustion_exact_run_cas_rejects_stale_row(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="cas", assignee="a")
+        claimed = kb.claim_task(conn, tid)
+        conn.execute("UPDATE tasks SET worker_pid=72001 WHERE id=?", (tid,))
+        conn.commit()
+        stale = conn.execute(
+            "SELECT id, worker_pid, claim_lock, current_run_id, title, body, "
+            "workspace_path FROM tasks WHERE id=?", (tid,),
+        ).fetchone()
+        conn.execute("UPDATE tasks SET current_run_id=current_run_id+1 WHERE id=?", (tid,))
+        conn.commit()
+        applied, _payload = kb._apply_iteration_exhaustion(
+            conn, stale, exit_code=kb.KANBAN_ITERATION_EXHAUSTED_EXIT_CODE,
+        )
+        assert applied is False
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.worker_pid == 72001
 
 
 

@@ -171,6 +171,7 @@ _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_CONFIG",
     "HERMES_ENV",
     "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_NON_DISPATCHER_CHILD",
 })
 
 # Windows-only: a handful of variables are required by the OS/CRT itself.
@@ -288,11 +289,11 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # a delegated child the parent's board mutation capability.
     try:
         from agent.delegation_context import (
-            is_delegated_child_process_context,
+            subprocess_requires_non_dispatcher_isolation,
             scrub_kanban_env,
         )
 
-        if is_delegated_child_process_context():
+        if subprocess_requires_non_dispatcher_isolation():
             scrubbed = scrub_kanban_env(scrubbed)
     except Exception:
         pass
@@ -744,10 +745,9 @@ def _rpc_server_loop(
                 # Suppress stdout/stderr from internal tool handlers so
                 # their status prints don't leak into the CLI spinner.
                 try:
-                    with thread_scoped_silence():
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
-                        )
+                    from agent.delegation_context import non_dispatcher_owned_context
+                    with non_dispatcher_owned_context(), thread_scoped_silence():
+                        result = handle_function_call(tool_name, tool_args, task_id=task_id)
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
                     result = tool_error(str(exc))
@@ -1019,10 +1019,9 @@ def _rpc_poll_loop(
 
                     # Dispatch through the standard tool handler
                     try:
-                        with thread_scoped_silence():
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
-                            )
+                        from agent.delegation_context import non_dispatcher_owned_context
+                        with non_dispatcher_owned_context(), thread_scoped_silence():
+                            tool_result = handle_function_call(tool_name, tool_args, task_id=task_id)
                     except Exception as exc:
                         logger.error("Tool call failed in remote sandbox: %s",
                                      exc, exc_info=True)
@@ -1898,7 +1897,7 @@ def _probe_python(python_path: str, code: str, *, text: bool = False):
     missing, can't be spawned, or hangs past the 5s timeout.
     """
     try:
-        from agent.delegation_context import delegated_child_subprocess_env
+        from agent.delegation_context import non_dispatcher_child_subprocess_env
 
         return subprocess.run(
             [python_path, "-c", code],
@@ -1907,7 +1906,7 @@ def _probe_python(python_path: str, code: str, *, text: bool = False):
             text=text,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             stdin=subprocess.DEVNULL,
-            env=delegated_child_subprocess_env(),
+            env=non_dispatcher_child_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
         return None

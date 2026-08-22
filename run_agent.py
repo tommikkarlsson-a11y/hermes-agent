@@ -8324,6 +8324,36 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Lifecycle transitions are terminal operations for a Kanban worker.
+        # Reject only lifecycle calls from a mixed batch, durably persist those
+        # rejections, and let unrelated calls finish before the model retries.
+        from agent.kanban_stop import KANBAN_LIFECYCLE_TOOLS
+        lifecycle_calls = [
+            tc for tc in tool_calls if tc.function.name in KANBAN_LIFECYCLE_TOOLS
+        ]
+        if lifecycle_calls and len(tool_calls) != 1:
+            from agent.tool_dispatch_helpers import make_tool_result_message
+            rejection = json.dumps({
+                "error": (
+                    "Kanban lifecycle tools must be the sole tool call in a turn; "
+                    "no lifecycle mutation was attempted. Retry this lifecycle call alone."
+                ),
+                "error_type": "kanban_lifecycle_mixed_batch",
+            })
+            for tc in lifecycle_calls:
+                messages.append(make_tool_result_message(
+                    tc.function.name, rejection, tc.id, effect_disposition="none"
+                ))
+            if self._flush_messages_to_session_db(messages) is False:
+                self._incremental_persistence_failed = True
+                return
+            assistant_message.tool_calls = [
+                tc for tc in tool_calls if tc.function.name not in KANBAN_LIFECYCLE_TOOLS
+            ]
+            tool_calls = assistant_message.tool_calls
+            if not tool_calls:
+                return
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:

@@ -17,7 +17,13 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+KANBAN_LIFECYCLE_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
+_TERMINAL_KANBAN_TOOLS = KANBAN_LIFECYCLE_TOOLS
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -105,4 +111,5 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
+    "KANBAN_LIFECYCLE_TOOLS",
 ]

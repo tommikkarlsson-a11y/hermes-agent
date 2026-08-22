@@ -164,7 +164,7 @@ KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
 def _assert_not_delegated_child_mutation() -> None:
-    """Reject Kanban state mutations from ``delegate_task`` child contexts.
+    """Reject Kanban state mutations from every non-dispatcher child context.
 
     The structured kanban tools and CLI dispatch layer both have fast-fail
     guards for better UX, but neither is a trust boundary: a delegated child can
@@ -175,14 +175,17 @@ def _assert_not_delegated_child_mutation() -> None:
     metadata mutator fails closed before touching durable state.
     """
     try:
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import is_non_dispatcher_child_process_context
 
-        delegated = is_delegated_child_process_context()
+        delegated = is_non_dispatcher_child_process_context()
     except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+        delegated = bool(
+            os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT")
+            or os.environ.get("HERMES_NON_DISPATCHER_CHILD")
+        )
     if delegated:
         raise PermissionError(
-            "delegate_task child contexts cannot mutate Kanban tasks or boards"
+            "non-dispatcher child contexts cannot mutate Kanban tasks or boards"
         )
 
 
@@ -429,6 +432,10 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# Dedicated worker sentinel for a typed agent iteration-budget exhaustion.
+# Kept distinct from EX_TEMPFAIL: quota failures may retry after cooldown,
+# while iteration exhaustion follows the fingerprinted one-recovery protocol.
+KANBAN_ITERATION_EXHAUSTED_EXIT_CODE = 76
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -1142,6 +1149,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional mandatory same-card reviewer. NULL keeps legacy/manual review.
+    required_reviewer: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1244,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            required_reviewer=(
+                row["required_reviewer"]
+                if "required_reviewer" in keys and row["required_reviewer"]
+                else None
             ),
         )
 
@@ -1424,7 +1438,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- When set, implementation completion is forbidden and same-card review
+    -- must be requested from this exact profile.
+    required_reviewer    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2681,6 +2698,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "required_reviewer" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "required_reviewer", "required_reviewer TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3186,6 +3208,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    required_reviewer: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3232,6 +3255,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    required_reviewer = _canonical_assignee(required_reviewer)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3519,8 +3543,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, block_kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, block_kind,
+                        required_reviewer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3547,6 +3572,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         initial_block_kind,
+                        required_reviewer,
                     ),
                 )
                 for pid in parents:
@@ -3576,6 +3602,7 @@ def create_task(
                         "block_kind": initial_block_kind,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "required_reviewer": required_reviewer,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -5373,6 +5400,44 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _required_reviewer_completion_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> Optional[str]:
+    """Validate durable same-card reviewer provenance before completion."""
+    task = get_task(conn, task_id)
+    if task is None or not task.required_reviewer:
+        return None
+    reviewer = _canonical_assignee(task.required_reviewer)
+    if expected_run_id is None:
+        return f"task requires reviewer {reviewer}; completion needs an active review run"
+    if task.status != "running" or _canonical_assignee(task.assignee) != reviewer:
+        return f"task requires reviewer {reviewer}; implementer completion is forbidden"
+    run = conn.execute(
+        "SELECT profile, status FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    if (
+        run is None
+        or run["status"] != "running"
+        or _canonical_assignee(run["profile"]) != reviewer
+    ):
+        return f"task requires durable active review-run provenance for {reviewer}"
+    claimed = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, int(expected_run_id)),
+    ).fetchone()
+    try:
+        payload = json.loads(claimed["payload"]) if claimed and claimed["payload"] else {}
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("source_status") != "review":
+        return "required-review completion run was not durably claimed from review"
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5417,6 +5482,11 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    reviewer_error = _required_reviewer_completion_error(
+        conn, task_id, expected_run_id
+    )
+    if reviewer_error:
+        raise ValueError(reviewer_error)
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5458,6 +5528,11 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
+        reviewer_error = _required_reviewer_completion_error(
+            conn, task_id, expected_run_id
+        )
+        if reviewer_error:
+            raise ValueError(reviewer_error)
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6563,7 +6638,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, required_reviewer "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6583,6 +6658,15 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        required_reviewer = _canonical_assignee(trow["required_reviewer"])
+        if required_reviewer:
+            requested_reviewer = _canonical_assignee(reviewer)
+            if requested_reviewer is not None and requested_reviewer != required_reviewer:
+                return _ret(
+                    False,
+                    f"task requires reviewer {required_reviewer}; got {requested_reviewer}",
+                )
+            reviewer = required_reviewer
         if reviewer is None:
             changes_run = conn.execute(
                 "SELECT id FROM task_runs "
@@ -8344,6 +8428,11 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    iteration_exhausted: list[str] = field(default_factory=list)
+    """Tasks whose worker emitted the typed iteration-budget sentinel."""
+    needs_codex: list[str] = field(default_factory=list)
+    """Coder tasks routed to the non-runnable NEEDS_CODEX lane by the
+    authoritative workspace probe, before claim/run creation."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8430,6 +8519,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_ITERATION_EXHAUSTED_EXIT_CODE:
+                return ("iteration_exhausted", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -9124,6 +9215,157 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def _task_contract_fingerprint(title: Optional[str], body: Optional[str]) -> str:
+    """Stable fingerprint for one normalized title/body acceptance contract."""
+    normalized = [
+        re.sub(r"\s+", " ", str(value or "")).strip()
+        for value in (title, body)
+    ]
+    raw = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _bounded_artifact_inventory(workspace: Optional[str], limit: int = 200) -> list[dict]:
+    """Return a deterministic, read-only, bounded inventory for recovery context."""
+    if not workspace or limit <= 0:
+        return []
+    root = Path(workspace).expanduser()
+    if not root.is_dir():
+        return []
+    items: list[dict] = []
+    pending = [root]
+    try:
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            except OSError:
+                continue
+            child_dirs: list[Path] = []
+            for entry in entries:
+                if entry.name in {".git", ".venv"}:
+                    continue
+                if len(items) >= limit:
+                    items.append({"truncated": True, "limit": limit})
+                    return items
+                try:
+                    path = Path(entry.path)
+                    rel = str(path.relative_to(root))
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    stat = entry.stat(follow_symlinks=False)
+                    items.append({
+                        "path": rel,
+                        "kind": "dir" if is_dir else "file",
+                        "size": None if is_dir else int(stat.st_size),
+                    })
+                    if is_dir:
+                        child_dirs.append(path)
+                except (OSError, ValueError):
+                    continue
+            # Stack is LIFO; reverse keeps traversal deterministic by name.
+            pending.extend(reversed(child_dirs))
+    except OSError:
+        return items
+    return items
+
+
+def _iteration_exhaustion_attempts(
+    conn: sqlite3.Connection, task_id: str, fingerprint: str,
+) -> int:
+    attempts = 0
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'iteration_exhausted' ORDER BY id",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and payload.get("fingerprint") == fingerprint:
+            attempts += 1
+    return attempts
+
+
+def _apply_iteration_exhaustion(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    exit_code: int,
+) -> tuple[bool, dict]:
+    """Apply the exact-current-run, one-recovery exhaustion protocol."""
+    task_id = row["id"]
+    run_id = row["current_run_id"]
+    fingerprint = _task_contract_fingerprint(row["title"], row["body"])
+    attempt = _iteration_exhaustion_attempts(conn, task_id, fingerprint) + 1
+    workspace = row["workspace_path"]
+    inventory = _bounded_artifact_inventory(workspace)
+    retry_status = _retry_status_for_run(conn, task_id)
+    blocked = attempt >= 2
+    recovery_instruction = (
+        "Reuse the preserved workspace and artifact inventory. Verify existing "
+        "work first, then complete only acceptance criteria not yet proven. "
+        "Do not repeat completed discovery or increase the iteration budget."
+    )
+    payload = {
+        "failure_reason": "iteration_budget_exhausted",
+        "exit_code": int(exit_code),
+        "fingerprint": fingerprint,
+        "attempt": attempt,
+        "workspace": workspace,
+        "workspace_preserved": True,
+        "artifact_inventory": inventory,
+        "missing_acceptance_slice": "acceptance criteria not yet proven by durable evidence",
+        "recovery_instruction": recovery_instruction,
+        "disposition": "blocked" if blocked else "requeued_once",
+        "retry_status": retry_status,
+    }
+    next_status = "blocked" if blocked else retry_status
+    error = (
+        "Iteration budget exhausted twice for unchanged title/body; controller "
+        "must materially narrow the contract before another spawn."
+        if blocked else
+        "Iteration budget exhausted; one fingerprinted recovery is permitted."
+    )
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, last_heartbeat_at = NULL, last_failure_error = ?, "
+        "block_kind = ? "
+        "WHERE id = ? AND status = 'running' AND worker_pid = ? "
+        "AND claim_lock IS ? AND current_run_id IS ?",
+        (
+            next_status,
+            error[:500],
+            "transient" if blocked else None,
+            task_id,
+            row["worker_pid"],
+            row["claim_lock"],
+            run_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        return False, payload
+    ended = _end_run(
+        conn,
+        task_id,
+        outcome="iteration_exhausted",
+        status="iteration_exhausted",
+        error=error,
+        metadata=payload,
+    )
+    if ended != run_id:
+        # The task CAS succeeded but run provenance did not: fail closed by
+        # keeping the card blocked rather than allowing an unproven retry.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'transient', "
+            "last_failure_error = ? WHERE id = ? AND current_run_id IS ?",
+            ("iteration exhaustion run CAS failed", task_id, run_id),
+        )
+        payload["disposition"] = "blocked_run_cas_failed"
+    _append_event(conn, task_id, "iteration_exhausted", payload, run_id=run_id)
+    return True, payload
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -9154,6 +9396,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    iteration_exhausted: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9167,7 +9410,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "current_run_id, title, body, workspace_path "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -9190,6 +9434,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if kind == "iteration_exhausted":
+                applied, payload = _apply_iteration_exhaustion(
+                    conn, row, exit_code=int(code or KANBAN_ITERATION_EXHAUSTED_EXIT_CODE)
+                )
+                if applied:
+                    exited_hook_payloads.append({
+                        "task_id": row["id"],
+                        "assignee": row["assignee"],
+                        "run_id": row["current_run_id"],
+                        "worker_pid": pid,
+                        "exit_kind": kind,
+                        "exit_code": code,
+                        "outcome": "iteration_exhausted",
+                        "retry_status": payload.get("retry_status"),
+                    })
+                    iteration_exhausted.append(row["id"])
+                continue
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
@@ -9407,6 +9668,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_iteration_exhausted = iteration_exhausted  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -10013,6 +10275,87 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the exact resolved main DB path for a file-backed connection."""
+    try:
+        row = next(r for r in conn.execute("PRAGMA database_list") if r[1] == "main")
+        return str(Path(row[2]).expanduser().resolve()) if row[2] else None
+    except Exception:
+        return None
+
+
+def _active_board_db_paths() -> list[str]:
+    """Exact, resolved, de-duplicated DB paths from the board registry."""
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for meta in boards:
+        raw = meta.get("db_path")
+        if not raw:
+            continue
+        try:
+            resolved = str(Path(str(raw)).expanduser().resolve())
+        except Exception:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            paths.append(resolved)
+    return paths
+
+
+def running_counts_all_boards(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return host-level running counts keyed by canonical assignee."""
+    current_path = _connection_db_path(conn)
+    paths = _active_board_db_paths()
+    if current_path and current_path not in paths:
+        paths.insert(0, current_path)
+    counts: dict[str, int] = {}
+    used_current = False
+    for path in paths:
+        other = None
+        try:
+            if current_path and path == current_path:
+                db = conn
+                used_current = True
+            else:
+                if not Path(path).exists():
+                    continue
+                db = sqlite3.connect(path, timeout=1)
+                db.row_factory = sqlite3.Row
+                other = db
+            for row in db.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            ):
+                assignee = _canonical_assignee(row["assignee"])
+                if assignee:
+                    counts[assignee] = counts.get(assignee, 0) + int(row["n"])
+        except Exception:
+            continue
+        finally:
+            if other is not None:
+                try:
+                    other.close()
+                except Exception:
+                    pass
+    if not used_current:
+        try:
+            for row in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
+            ):
+                assignee = _canonical_assignee(row["assignee"])
+                if assignee:
+                    counts[assignee] = counts.get(assignee, 0) + int(row["n"])
+        except Exception:
+            pass
+    return counts
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
@@ -10031,21 +10374,15 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
     except Exception:
         current_path = None
-    try:
-        boards = list_boards(include_archived=False)
-    except Exception:
-        return 0
     total = 0
-    for meta in boards:
-        slug = meta.get("slug") or DEFAULT_BOARD
+    for resolved in _active_board_db_paths():
         try:
-            path = kanban_db_path(board=slug).expanduser()
-            resolved = str(path.resolve())
             if current_path is not None and resolved == current_path:
                 continue
+            path = Path(resolved)
             if not path.exists():
                 continue
-            other = connect(board=slug)
+            other = sqlite3.connect(str(path), timeout=1)
             try:
                 total += count_running_tasks(other)
             finally:
@@ -10078,6 +10415,151 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         )
     except Exception:
         return "unknown"
+
+
+def _profile_terminal_config(assignee: str) -> tuple[str, dict]:
+    """Load the assignee's actual terminal backend/config without env mutation."""
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config
+
+    token = set_hermes_home_override(resolve_profile_env(assignee))
+    try:
+        terminal = dict((load_config().get("terminal") or {}))
+    finally:
+        reset_hermes_home_override(token)
+    return str(terminal.get("backend") or "local").strip().lower(), terminal
+
+
+def _parse_docker_volume(value: str) -> Optional[tuple[str, str]]:
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return None
+    parts = text.rsplit(":", 2)
+    modes = {"ro", "rw", "z", "delegated", "cached"}
+    if len(parts) == 3 and parts[2].lower().split(",", 1)[0] in modes:
+        host, target = parts[0], parts[1]
+    else:
+        host, target = text.rsplit(":", 1)
+    return (host, target) if host and target else None
+
+
+def _workspace_compatibility_probe(
+    assignee: str, workspace: Optional[str],
+) -> tuple[Optional[bool], str]:
+    """Bounded authoritative read probe for local and Docker profiles."""
+    if not workspace:
+        return None, "workspace is dispatcher-resolved scratch/worktree"
+    host_workspace = Path(workspace).expanduser()
+    try:
+        backend, terminal = _profile_terminal_config(assignee)
+    except Exception as exc:
+        # A non-Hermes control-plane/test lane is outside this probe's local /
+        # Docker contract. Real profiles are filtered by profile_exists before
+        # this helper; their config is authoritative when available.
+        return None, f"profile terminal config unavailable: {exc}"
+    if backend in {"", "local"}:
+        try:
+            if not host_workspace.is_dir():
+                return False, f"local workspace is not a directory: {host_workspace}"
+            with os.scandir(host_workspace) as entries:
+                next(entries, None)
+            return True, f"local read probe passed: {host_workspace}"
+        except OSError as exc:
+            return False, f"local read probe failed: {exc}"
+    if backend != "docker":
+        return None, f"preclaim probe not defined for backend {backend}"
+    try:
+        resolved_workspace = host_workspace.resolve()
+    except OSError as exc:
+        return False, f"docker host workspace resolution failed: {exc}"
+    mappings: list[tuple[Path, str]] = []
+    for raw in terminal.get("docker_volumes") or []:
+        parsed = _parse_docker_volume(raw)
+        if parsed:
+            mappings.append((Path(parsed[0]).expanduser().resolve(), parsed[1]))
+    if terminal.get("docker_mount_cwd_to_workspace"):
+        mappings.append((resolved_workspace, "/workspace"))
+    candidates: list[tuple[int, Path, str, Path]] = []
+    for source, target in mappings:
+        try:
+            relative = resolved_workspace.relative_to(source)
+        except ValueError:
+            continue
+        candidates.append((len(source.parts), source, target, relative))
+    if not candidates:
+        return False, "docker config has no bind mount containing the workspace"
+    _, source, target, relative = max(candidates, key=lambda item: item[0])
+    if not source.is_dir():
+        return False, f"docker mount source is not a directory: {source}"
+    container_workspace = str(Path(target) / relative)
+    image = str(terminal.get("docker_image") or "nikolaik/python-nodejs:python3.11-nodejs20")
+    try:
+        probe = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none",
+             "-v", f"{source}:{target}:ro", image, "sh", "-c",
+             'test -d "$1" && test -r "$1"', "hermes-workspace-probe",
+             container_workspace],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"docker read probe could not run: {exc}"
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "read probe failed").strip()[:300]
+        return False, f"docker read probe failed ({probe.returncode}): {detail}"
+    return True, f"docker read probe passed: {source} -> {container_workspace}"
+
+
+def _route_coder_to_needs_codex(
+    conn: sqlite3.Connection, task_id: str, reason: str,
+) -> bool:
+    """Route an unreachable coder task before claim/run/failure accounting."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET assignee = 'needs_codex', last_failure_error = ? "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
+            "AND lower(assignee) = 'coder'",
+            (reason[:500], task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "workspace_unreachable", {
+            "route": "NEEDS_CODEX", "reason": reason, "preclaim": True,
+        })
+    return True
+
+
+def _block_unchanged_exhausted_contract(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Prevent a third unchanged spawn after two typed exhaustions."""
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ? AND status = 'ready' "
+        "AND claim_lock IS NULL", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    fingerprint = _task_contract_fingerprint(row["title"], row["body"])
+    if _iteration_exhaustion_attempts(conn, task_id, fingerprint) < 2:
+        return False
+    reason = (
+        "unchanged title/body already exhausted the iteration budget twice; "
+        "materially narrow the contract before unblocking"
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'transient', "
+            "last_failure_error = ? WHERE id = ? "
+            "AND status = 'ready' AND claim_lock IS NULL",
+            (reason, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "iteration_exhaustion_spawn_refused", {
+            "fingerprint": fingerprint, "reason": reason,
+        })
+    return True
 
 
 def dispatch_once(
@@ -10243,6 +10725,11 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    _crash_iteration_exhausted = getattr(
+        detect_crashed_workers, "_last_iteration_exhausted", []
+    )
+    if _crash_iteration_exhausted:
+        result.iteration_exhausted.extend(_crash_iteration_exhausted)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -10309,7 +10796,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10318,7 +10805,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_path FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
@@ -10362,14 +10849,9 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
-    _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
-        for prow in conn.execute(
-            "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
-            "GROUP BY assignee"
-        ):
-            _per_profile_running[prow["assignee"]] = int(prow["n"])
+    _per_profile_running: dict[str, int] = (
+        running_counts_all_boards(conn) if _per_profile_cap is not None else {}
+    )
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -10455,6 +10937,23 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Exact-current-run exhaustion guard and authoritative local/Docker
+        # workspace probe both run before claim_task, so neither path creates a
+        # run nor consumes generic failure accounting.
+        if _block_unchanged_exhausted_contract(conn, row["id"]):
+            continue
+        probe_ok, probe_reason = _workspace_compatibility_probe(
+            row_assignee, row["workspace_path"]
+        )
+        if probe_ok is False:
+            if (
+                _canonical_assignee(row_assignee) == "coder"
+                and _route_coder_to_needs_codex(conn, row["id"], probe_reason)
+            ):
+                result.needs_codex.append(row["id"])
+            else:
+                result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10602,6 +11101,12 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        probe_ok, _probe_reason = _workspace_compatibility_probe(
+            row["assignee"], row["workspace_path"]
+        )
+        if probe_ok is False:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:

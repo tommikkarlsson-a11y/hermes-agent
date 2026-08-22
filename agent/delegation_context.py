@@ -33,6 +33,7 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 )
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+NON_DISPATCHER_CHILD_ENV_MARKER = "HERMES_NON_DISPATCHER_CHILD"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
@@ -121,6 +122,18 @@ def exit_non_dispatcher_owned_context(token: Token[bool]) -> None:
     _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
 
 
+def is_non_dispatcher_child_process_context() -> bool:
+    """Return True for any execution that cannot own a Kanban worker run."""
+    import os
+
+    return bool(
+        _DELEGATED_CHILD_CONTEXT.get()
+        or _NON_DISPATCHER_OWNED_CONTEXT.get()
+        or os.environ.get(NON_DISPATCHER_CHILD_ENV_MARKER)
+        or os.environ.get(DELEGATED_CHILD_ENV_MARKER)
+    )
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     import os
@@ -130,12 +143,29 @@ def is_delegated_child_process_context() -> bool:
     )
 
 
+def subprocess_requires_non_dispatcher_isolation() -> bool:
+    """Whether a subprocess must lose dispatcher-owned Kanban authority.
+
+    Besides already-isolated delegate/cron execution, every subprocess started
+    by a top-level Kanban worker is a child rather than the dispatcher-owned
+    run itself.  The parent keeps its process environment untouched.
+    """
+    import os
+
+    return is_non_dispatcher_child_process_context() or bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+    )
+
+
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Return *env* with dispatcher-only Kanban variables removed."""
     cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
-    cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
+    for key in list(cleaned):
+        if key.startswith("HERMES_KANBAN_"):
+            cleaned.pop(key, None)
+    cleaned[NON_DISPATCHER_CHILD_ENV_MARKER] = "1"
+    if is_delegated_child_process_context():
+        cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 
 
@@ -154,6 +184,19 @@ def delegated_child_subprocess_env(
     if not is_delegated_child_process_context():
         return None if env is None else dict(env)
 
+    if env is None:
+        import os
+
+        env = os.environ
+    return scrub_kanban_env(env)
+
+
+def non_dispatcher_child_subprocess_env(
+    env: Mapping[str, str] | MutableMapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Scrub every child launched by a worker; preserve normal calls unchanged."""
+    if not subprocess_requires_non_dispatcher_isolation():
+        return None if env is None else dict(env)
     if env is None:
         import os
 

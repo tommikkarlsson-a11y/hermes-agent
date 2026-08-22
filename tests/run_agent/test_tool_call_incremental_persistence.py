@@ -57,7 +57,10 @@ def _make_agent():
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search"),
+            return_value=_make_tool_defs(
+                "web_search", "kanban_complete", "kanban_block",
+                "kanban_request_review", "kanban_request_changes",
+            ),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -379,6 +382,93 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
         ("dispatch", "c2"),
         ("flush", "tool", "c2"),
     ]
+
+
+def test_mixed_batch_rejects_lifecycle_mutation_but_runs_other_tools():
+    agent = _make_agent()
+    assistant = SimpleNamespace(content="", tool_calls=[
+        _mock_tool_call(name="kanban_complete", call_id="life"),
+        _mock_tool_call(name="web_search", call_id="read"),
+    ])
+    messages = []
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    agent._execute_tool_calls_sequential = MagicMock()
+    agent._execute_tool_calls_concurrent = MagicMock()
+
+    agent._execute_tool_calls(assistant, messages, "task-1")
+
+    lifecycle_result = next(m for m in messages if m.get("tool_call_id") == "life")
+    assert "kanban_lifecycle_mixed_batch" in lifecycle_result["content"]
+    assert [tc.function.name for tc in assistant.tool_calls] == ["web_search"]
+    assert agent._execute_tool_calls_sequential.called or agent._execute_tool_calls_concurrent.called
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes"],
+)
+def test_successful_sole_lifecycle_result_flushes_and_latches(tool_name):
+    agent = _make_agent()
+    agent._kanban_lifecycle_exit_reason = None
+    assistant = SimpleNamespace(
+        content="", tool_calls=[_mock_tool_call(name=tool_name, call_id="life")],
+    )
+    messages = []
+    flushed = []
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=lambda msgs, conversation_history=None: flushed.append(copy.deepcopy(msgs)) or True
+    )
+    with (
+        patch("run_agent.handle_function_call", return_value='{"success": true}'),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(assistant, messages, "task-1")
+    assert flushed[-1][-1]["tool_call_id"] == "life"
+    assert agent._kanban_lifecycle_exit_reason == f"kanban_lifecycle:{tool_name}"
+
+
+def test_unsuccessful_sole_lifecycle_result_does_not_latch():
+    agent = _make_agent()
+    agent._kanban_lifecycle_exit_reason = None
+    assistant = SimpleNamespace(
+        content="", tool_calls=[_mock_tool_call(name="kanban_complete", call_id="life")],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    with (
+        patch("run_agent.handle_function_call", return_value='{"success": false, "error": "CAS"}'),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(assistant, [], "task-1")
+    assert agent._kanban_lifecycle_exit_reason is None
+
+
+def test_successful_lifecycle_exits_before_another_model_turn():
+    agent = _make_agent()
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="", finish_reason="tool_calls",
+        tool_calls=[_mock_tool_call(name="kanban_complete", call_id="life")],
+    )
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+    with (
+        patch("run_agent.handle_function_call", return_value='{"success": true}'),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("finish")
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "kanban_lifecycle:kanban_complete"
+    assert result["final_response"] == ""
 
 
 def test_sequential_keyboard_interrupt_emits_results_for_all_calls():
