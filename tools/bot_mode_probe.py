@@ -4,7 +4,7 @@ When the desktop's Bot Mode manages this install (any profile carries a
 ``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
 "Bot Chat" session — and ONLY that session — gets a short "Messaging other
 agents" section so the bot can receive teammate DMs, reply with attribution,
-and hand off @mentions.  Regular sessions never carry the section; the
+and route @mentions.  Regular sessions never carry the section; the
 desktop's composer middleware owns the @mention send path there.
 
 The caller (agent/system_prompt.py) enforces the session-title gate against
@@ -175,15 +175,22 @@ def _build_section(home: Path) -> str:
         "terminal tool (background=true, notify_on_complete=true) and finish your "
         "turn — the reply arrives later as a new message:\n"
         "```\n"
-        f'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file /tmp/dm.txt\n'
+        f'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q --run-budget 300 --query-file /tmp/dm.txt\n'
         "```\n"
         f'The file must open with the "Message from 🤖 {handle} (@{handle}):" prefix so they '
         "know who is talking. When YOU receive a message with that prefix, you are "
         "being messaged by a teammate agent — address them (not the user) and reply "
-        "concisely. When the user says \"ask <name>\" or \"tell <name> ...\", that is a "
-        "handoff: message that agent, wait for the reply, and report back, saying "
-        "which agent it came from. Run `hermes profile list` for the LIVE teammate "
-        f"list before a handoff. Teammates at session start: {teammates}."
+        "concisely. Bot Chat is advisory/wake-up only: it cannot perform durable "
+        "work, approve, review, or complete work. For an advisory request, include "
+        "one request_id, MODE=advice, one question/outcome, at most five context "
+        "bullets, the authority limit, response shape, and promote/stop condition. "
+        "Require the same request_id plus STATUS=answered|blocked|needs-decision, "
+        "the answer, evidence references, material risk, and recommended next owner. "
+        "Allow no side effects or recursive bot chatter. The --run-budget bound is "
+        "five minutes; if advice is unavailable, continue when optional or use Kanban "
+        "for decision-relevant durable work. Attribute any answer to its agent. Run "
+        "`hermes profile list` for the LIVE teammate list before messaging. "
+        f"Teammates at session start: {teammates}."
         + _peer_paragraph(root)
     )
 
