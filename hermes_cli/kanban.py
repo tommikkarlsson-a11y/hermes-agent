@@ -601,6 +601,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_invalidate_completion = sub.add_parser(
+        "invalidate-completion",
+        help="Controller-only invalidation of one exact accepted completion",
+        description=(
+            "Atomically retract one exact accepted completion, preserve its "
+            "run history as invalidated, block the task fail-closed, and "
+            "re-gate descendants. Requires an explicit global --board and "
+            "refuses dispatcher-worker contexts."
+        ),
+    )
+    p_invalidate_completion.add_argument("task_id")
+    p_invalidate_completion.add_argument(
+        "--run-id",
+        type=int,
+        required=True,
+        help="Exact latest accepted completed run id to supersede",
+    )
+    p_invalidate_completion.add_argument(
+        "--reason",
+        required=True,
+        help="Non-empty audit reason (secrets are redacted before persistence)",
+    )
+    p_invalidate_completion.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit non-secret machine-readable readback",
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1064,6 +1092,20 @@ def kanban_command(args: argparse.Namespace) -> int:
     # keeps the patch small and inherits the exact same resolution the
     # dispatcher uses for workers — consistency is a feature here.
     board_override = getattr(args, "board", None)
+    if action == "invalidate-completion":
+        if _has_dispatcher_worker_identity():
+            print(
+                "kanban: invalidate-completion is controller-only; "
+                "dispatcher-worker Kanban identity is present",
+                file=sys.stderr,
+            )
+            return 1
+        if not board_override:
+            print(
+                "kanban: invalidate-completion requires an explicit --board <slug>",
+                file=sys.stderr,
+            )
+            return 2
     board_scope = contextlib.nullcontext()
     if board_override:
         try:
@@ -1126,6 +1168,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "invalidate-completion": _cmd_invalidate_completion,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1194,6 +1237,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "invalidate-completion",
     "edit",
     "block",
     "schedule",
@@ -2199,6 +2243,19 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _has_dispatcher_worker_identity() -> bool:
+    """Return whether this process carries dispatcher-issued Kanban identity."""
+    return any(
+        os.environ.get(name)
+        for name in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_WORKSPACE",
+        )
+    )
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
@@ -2304,6 +2361,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_invalidate_completion(args: argparse.Namespace) -> int:
+    """Controller-only exact-run completion invalidation."""
+    with kb.connect_closing() as conn:
+        result = kb.invalidate_completed_task(
+            conn,
+            args.task_id,
+            superseded_run_id=args.run_id,
+            reason=args.reason,
+            author=_profile_author(),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    print(
+        f"Invalidated completion for {result['task_id']}: "
+        f"run {result['superseded_run_id']} -> invalidated; task -> blocked"
+    )
+    print(f"Reason: {result['reason']}")
+    print(f"Descendants re-gated: {len(result['descendants'])}")
+    print(f"Worker terminations: {len(result['terminations'])}")
+    return 0
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
