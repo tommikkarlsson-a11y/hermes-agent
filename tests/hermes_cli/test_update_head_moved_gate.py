@@ -88,6 +88,11 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_stash_local_changes_if_needed", lambda *a, **k: None
     )
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
+    # The real updater evicts every cached Hermes module after a successful
+    # checkout change. That process-global side effect is outside this test's
+    # HEAD-movement contract and invalidates modules already collected by
+    # later test files, making the suite order-dependent.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
     )
