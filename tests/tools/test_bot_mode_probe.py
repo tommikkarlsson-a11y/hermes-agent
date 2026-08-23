@@ -53,6 +53,11 @@ def test_emits_for_default_when_any_profile_is_managed(tmp_path):
     assert "@default" not in section
     assert "@researcher" in section
     assert "message_agent" in section
+    assert "Kanban" in section
+    assert "advisory" in section.lower()
+    assert "final response" in section.lower()
+    assert "supersedes" in section.lower()
+    assert bot_mode_probe.BOT_MODE_PROTOCOL_VERSION == 3
 
 
 def test_emits_for_named_profile_with_own_handle(tmp_path):
@@ -94,13 +99,25 @@ def test_roster_lines_carry_roles(tmp_path):
     assert "Deep research and literature review" in section
 
 
-def test_silent_when_soul_already_carries_protocol(tmp_path):
-    """Legacy plugin-side append — never double the section."""
+def test_legacy_soul_protocol_is_superseded_by_v3(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     _make_bot_profile(home, "coder", managed=True)
     (home / "SOUL.md").write_text(
         "# Me\n\n## Messaging other agents\nold plugin text\n", encoding="utf-8"
+    )
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+    assert "HERMES_BOT_MODE_PROTOCOL_V3" in section
+    assert "supersedes" in section
+
+
+def test_silent_when_soul_already_carries_v3_protocol(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "coder", managed=True)
+    (home / "SOUL.md").write_text(
+        "# Me\n\n## Messaging other agents\n[HERMES_BOT_MODE_PROTOCOL_V3]\n",
+        encoding="utf-8",
     )
     assert bot_mode_probe.get_bot_mode_protocol_section(home) == ""
 
@@ -211,16 +228,21 @@ def test_legacy_bot_chat_upgrade(tmp_path):
     upgraded = legacy + "\n\n" + bot_mode_probe.get_bot_mode_protocol_section(home) + "\n\n" + bot_mode_probe.epoch_line(home)
     assert not bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(upgraded, home)
 
-    # SOUL already carries the legacy plugin-side append → probe silent →
-    # no upgrade (rebuilding would loop: the new prompt would be unstamped too)
+    # A legacy plugin-side SOUL append is superseded by v3 on one rebuild.
     bot_mode_probe._reset_cache_for_tests()
     (home / "SOUL.md").write_text("# Me\n\n## Messaging other agents\nlegacy\n", encoding="utf-8")
-    assert not bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(legacy, home)
+    assert bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(legacy, home)
 
-    # prompt whose SOUL section rode into it → protocol heading present → no upgrade
-    assert not bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(
+    # A stored legacy heading without the v3 marker also rebuilds once.
+    assert bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(
         "prompt containing\n## Messaging other agents\nfrom SOUL", home
     )
+
+    current = (
+        "prompt containing\n## Messaging other agents\n"
+        "[HERMES_BOT_MODE_PROTOCOL_V3]"
+    )
+    assert not bot_mode_probe.stored_bot_chat_prompt_needs_upgrade(current, home)
 
     # unmanaged install → probe silent → never upgrades
     bot_mode_probe._reset_cache_for_tests()

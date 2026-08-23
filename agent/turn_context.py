@@ -709,6 +709,13 @@ def build_turn_context(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+    # Local Bot Mode DMs are advisory for exactly one receiving turn. Recompute
+    # from the clean inbound message on every turn so the fence cannot leak into
+    # a later human request in the same eternal Bot Chat session.
+    from agent.bot_advisory import mark_advisory_turn
+
+    mark_advisory_turn(agent, original_user_message)
+
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
     if (agent._memory_nudge_interval > 0

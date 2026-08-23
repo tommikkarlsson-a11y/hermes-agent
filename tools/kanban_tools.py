@@ -1683,6 +1683,89 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+def _auto_subscribe_request() -> tuple[bool, Optional[dict[str, Any]]]:
+    """Resolve a trusted origin route without writing Kanban state.
+
+    The boolean means an attached origin requires atomic admission. ``None``
+    with a true boolean therefore fails closed into ``subscription_gate``.
+    Unattached CLI/cron calls and an explicit config opt-out keep legacy create.
+    """
+    try:
+        cfg = load_config()
+        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            return False, None
+    except Exception:
+        pass
+
+    attached = False
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if platform or chat_id:
+            attached = True
+            if not platform or not chat_id:
+                return True, None
+        else:
+            session_key = (
+                get_session_env("HERMES_SESSION_KEY", "")
+                or os.environ.get("HERMES_SESSION_KEY", "")
+            )
+            if not session_key:
+                return False, None
+            platform, chat_id, attached = "tui", session_key, True
+
+        is_gateway_session = platform != "tui"
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        user_id_alt = get_session_env("HERMES_SESSION_USER_ID_ALT", "") or None
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+        notifier_profile = (
+            get_session_env("HERMES_SESSION_PROFILE", "")
+            or os.environ.get("HERMES_PROFILE")
+        )
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                notifier_profile = get_active_profile_name() or "default"
+            except Exception:
+                notifier_profile = "default"
+
+        delivery_metadata: dict[str, Any] = {}
+        if thread_id:
+            delivery_metadata["thread_id"] = thread_id
+        if chat_type:
+            delivery_metadata["chat_type"] = chat_type
+        if (
+            platform.lower() == "telegram"
+            and thread_id
+            and (chat_type or "").lower() in {"dm", "direct", "private"}
+        ):
+            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+            if str(thread_id) not in {"", "1"}:
+                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
+            if message_id:
+                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
+
+        return True, {
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "user_id_alt": user_id_alt,
+            "chat_type": chat_type,
+            "notifier_profile": notifier_profile,
+            "delivery_mode": "notify+wake" if is_gateway_session else None,
+            "delivery_metadata": delivery_metadata or None,
+        }
+    except Exception as exc:
+        logger.warning("origin subscription resolution failed: %r", exc)
+        return attached, None
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1739,6 +1822,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    max_retries = args.get("max_retries")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1776,8 +1860,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
-            new_tid = kb.create_task(
-                conn,
+            create_kwargs = dict(
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
@@ -1794,6 +1877,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                max_retries=(int(max_retries) if max_retries is not None else None),
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -1802,12 +1886,33 @@ def _handle_create(args: dict, **kw) -> str:
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
-                initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            requires_admission, subscription = _auto_subscribe_request()
+            if requires_admission:
+                if not str(idempotency_key or "").strip():
+                    return tool_error(
+                        "attached kanban_create requires a non-empty idempotency_key"
+                    )
+                if triage or "initial_status" in args:
+                    return tool_error(
+                        "attached kanban_create admission does not support triage "
+                        "or initial_status"
+                    )
+                new_tid, subscribed = kb.create_admitted_task(
+                    conn,
+                    subscription=subscription,
+                    **create_kwargs,
+                )
+            else:
+                new_tid = kb.create_task(
+                    conn,
+                    initial_status=str(initial_status),
+                    **create_kwargs,
+                )
+                subscribed = _maybe_auto_subscribe(conn, new_tid)
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,

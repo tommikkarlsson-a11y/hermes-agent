@@ -101,7 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
-VALID_INITIAL_BLOCK_KINDS = {"subscription_gate"}
+VALID_INITIAL_BLOCK_KINDS = {"admission_gate", "subscription_gate"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3707,6 +3707,312 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def _release_creation_gate_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    contract_fingerprint: Optional[str] = None,
+    origin_route_fingerprint: Optional[str] = None,
+) -> bool:
+    """Release an admission gate inside its caller's existing write transaction."""
+    new_status = _landing_status_after_parents(conn, task_id)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, block_kind = NULL "
+        "WHERE id = ? AND status = 'blocked' AND block_kind = 'admission_gate'",
+        (new_status, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    payload = {"status": new_status}
+    if contract_fingerprint:
+        payload["contract_fingerprint"] = contract_fingerprint
+        payload["origin_route_fingerprint"] = origin_route_fingerprint
+    _append_event(conn, task_id, "admission_gate_released", payload)
+    return True
+
+
+def _move_creation_to_subscription_gate_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    contract_fingerprint: Optional[str] = None,
+    origin_route_fingerprint: Optional[str] = None,
+) -> bool:
+    cur = conn.execute(
+        "UPDATE tasks SET block_kind = 'subscription_gate' "
+        "WHERE id = ? AND status = 'blocked' AND block_kind = 'admission_gate'",
+        (task_id,),
+    )
+    if cur.rowcount != 1:
+        return False
+    payload = {"reason": reason}
+    if contract_fingerprint:
+        payload["contract_fingerprint"] = contract_fingerprint
+        payload["origin_route_fingerprint"] = origin_route_fingerprint
+    _append_event(conn, task_id, "subscription_gate", payload)
+    return True
+
+
+def _admission_fingerprint(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stored_admission_contract(
+    conn: sqlite3.Connection,
+    task_id: str,
+    requested: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Validate immutable requested fields and fingerprint the stored mission."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise RuntimeError("admitted task disappeared during creation")
+
+    idempotency_key = str(requested.get("idempotency_key") or "").strip()
+    if not idempotency_key:
+        raise ValueError("admitted task creation requires an idempotency_key")
+    if requested.get("triage"):
+        raise ValueError("admitted task creation does not support triage")
+
+    expected = {
+        "title": str(requested.get("title") or "").strip(),
+        "body": requested.get("body"),
+        "assignee": _canonical_assignee(requested.get("assignee")),
+        "created_by": requested.get("created_by"),
+        "tenant": requested.get("tenant"),
+        "priority": int(requested.get("priority") or 0),
+        "idempotency_key": idempotency_key,
+        "max_runtime_seconds": requested.get("max_runtime_seconds"),
+        "skills": (
+            list(requested["skills"])
+            if requested.get("skills") is not None
+            else None
+        ),
+        "max_retries": requested.get("max_retries"),
+        "model_override": (requested.get("model_override") or "").strip() or None,
+        "provider_override": (requested.get("provider_override") or "").strip() or None,
+        "reasoning_effort": normalize_reasoning_effort(
+            requested.get("reasoning_effort")
+        ),
+        "goal_mode": bool(requested.get("goal_mode", False)),
+        "goal_max_turns": requested.get("goal_max_turns"),
+        "session_id": requested.get("session_id"),
+        "required_reviewer": _canonical_assignee(
+            requested.get("required_reviewer")
+        ),
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected.items()
+        if getattr(task, field) != expected_value
+    ]
+
+    requested_project = (requested.get("project_id") or "").strip() or None
+    if requested_project is not None and task.project_id != requested_project:
+        mismatches.append("project_id")
+    if requested_project is None:
+        if task.workspace_kind != requested.get("workspace_kind", "scratch"):
+            mismatches.append("workspace_kind")
+        if task.workspace_path != requested.get("workspace_path"):
+            mismatches.append("workspace_path")
+        requested_branch = (requested.get("branch_name") or "").strip() or None
+        if task.branch_name != requested_branch:
+            mismatches.append("branch_name")
+
+    stored_parents = sorted(
+        row["parent_id"]
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        ).fetchall()
+    )
+    requested_parents = sorted(dict.fromkeys(requested.get("parents") or ()))
+    if stored_parents != requested_parents:
+        mismatches.append("parents")
+    if mismatches:
+        raise RuntimeError(
+            "admission contract collision on: " + ", ".join(sorted(set(mismatches)))
+        )
+
+    contract = dict(expected)
+    contract.update(
+        {
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "branch_name": task.branch_name,
+            "project_id": task.project_id,
+            "parents": stored_parents,
+        }
+    )
+    return contract, _admission_fingerprint(contract)
+
+
+def _latest_admission_receipt(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[Mapping[str, Any]]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('admission_gate_released', 'subscription_gate', "
+        "'subscription_gate_released') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _release_subscription_gate_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    contract_fingerprint: str,
+    origin_route_fingerprint: str,
+) -> bool:
+    new_status = _landing_status_after_parents(conn, task_id)
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, block_kind = NULL "
+        "WHERE id = ? AND status = 'blocked' AND block_kind = 'subscription_gate'",
+        (new_status, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(
+        conn,
+        task_id,
+        "subscription_gate_released",
+        {
+            "status": new_status,
+            "contract_fingerprint": contract_fingerprint,
+            "origin_route_fingerprint": origin_route_fingerprint,
+        },
+    )
+    return True
+
+
+def create_admitted_task(
+    conn: sqlite3.Connection,
+    *,
+    subscription: Optional[Mapping[str, Any]],
+    **task_kwargs: Any,
+) -> tuple[str, bool]:
+    """Create an attached-origin task without a pre-subscription dispatch race.
+
+    A fresh task is invisible outside one ``BEGIN IMMEDIATE`` while it enters an
+    admission gate, receives its trusted origin subscription, and lands in the
+    normal parent-derived state. Subscription absence/failure commits only a
+    typed ``subscription_gate`` task, which the dispatcher cannot claim.
+    Idempotent retries may return an already-admitted winner but never re-open or
+    release a later worker-authored block.
+    """
+    if "initial_status" in task_kwargs or "initial_block_kind" in task_kwargs:
+        raise ValueError("create_admitted_task owns the initial admission gate")
+    if not str(task_kwargs.get("idempotency_key") or "").strip():
+        raise ValueError("admitted task creation requires an idempotency_key")
+
+    with write_txn(conn):
+        task_id = create_task(
+            conn,
+            **task_kwargs,
+            initial_status="blocked",
+            initial_block_kind="admission_gate",
+        )
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        fresh_gate = bool(
+            row
+            and row["status"] == "blocked"
+            and row["block_kind"] == "admission_gate"
+        )
+        _contract, contract_fingerprint = _stored_admission_contract(
+            conn, task_id, task_kwargs
+        )
+        route_fingerprint = (
+            _admission_fingerprint(dict(subscription))
+            if subscription is not None
+            else None
+        )
+        receipt = _latest_admission_receipt(conn, task_id)
+        if not fresh_gate:
+            if not receipt or receipt.get("contract_fingerprint") != contract_fingerprint:
+                raise RuntimeError(
+                    "idempotency key belongs to a non-admitted or mismatching task"
+                )
+            receipt_route = receipt.get("origin_route_fingerprint")
+            if receipt_route and route_fingerprint and receipt_route != route_fingerprint:
+                raise RuntimeError("admitted task is bound to a different origin route")
+
+        if subscription is None:
+            if fresh_gate:
+                _move_creation_to_subscription_gate_in_txn(
+                    conn,
+                    task_id,
+                    reason="origin subscription unavailable",
+                    contract_fingerprint=contract_fingerprint,
+                )
+            return task_id, False
+
+        try:
+            add_notify_sub(conn, task_id=task_id, **dict(subscription))
+        except Exception as exc:
+            if fresh_gate:
+                _move_creation_to_subscription_gate_in_txn(
+                    conn,
+                    task_id,
+                    reason=f"origin subscription failed: {type(exc).__name__}",
+                    contract_fingerprint=contract_fingerprint,
+                    origin_route_fingerprint=route_fingerprint,
+                )
+            return task_id, False
+
+        gate_released = False
+        if fresh_gate:
+            gate_released = _release_creation_gate_in_txn(
+                conn,
+                task_id,
+                contract_fingerprint=contract_fingerprint,
+                origin_route_fingerprint=route_fingerprint,
+            )
+        elif row["status"] == "blocked" and row["block_kind"] == "subscription_gate":
+            gate_released = _release_subscription_gate_in_txn(
+                conn,
+                task_id,
+                contract_fingerprint=contract_fingerprint,
+                origin_route_fingerprint=route_fingerprint,
+            )
+
+        if gate_released:
+            latest_event = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? "
+                "AND thread_id = ? AND notifier_profile = ?",
+                (
+                    int(latest_event["cursor"]),
+                    task_id,
+                    subscription["platform"],
+                    subscription["chat_id"],
+                    subscription.get("thread_id") or "",
+                    subscription.get("notifier_profile") or "default",
+                ),
+            )
+        return task_id, True
+
+
 def create_supervised_task(
     conn: sqlite3.Connection,
     *,
@@ -3807,6 +4113,8 @@ def create_supervised_task(
                 goal_max_turns=turns,
                 session_id=session_id,
                 board=board,
+                initial_status="blocked",
+                initial_block_kind="admission_gate",
             )
         )
         task_row = conn.execute(
@@ -3873,6 +4181,17 @@ def create_supervised_task(
                     deadline_at,
                 ),
             )
+        _release_creation_gate_in_txn(conn, task_id)
+        release_cursor = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND notifier_profile = ? "
+            "AND supervision_session_id = ?",
+            (int(release_cursor["cursor"]), task_id, profile, session_id),
+        )
         return task_id
 
 
@@ -12566,7 +12885,7 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
