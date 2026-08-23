@@ -87,6 +87,16 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
+        for supervision_column in (
+            "supervision_session_id",
+            "supervision_deadline_generation",
+            "supervision_deadline_at",
+            "supervision_pending_event_id",
+            "supervision_lease_token",
+            "supervision_lease_expires_at",
+            "supervision_attempts",
+        ):
+            assert supervision_column in lei
 
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
@@ -94,6 +104,13 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
         # Non-numeric legacy cursor ("e-1") casts to 0.
         assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
+        legacy_route = conn.execute(
+            "SELECT supervision_session_id, supervision_deadline_generation, "
+            "supervision_attempts FROM kanban_notify_subs"
+        ).fetchone()
+        assert legacy_route["supervision_session_id"] is None
+        assert legacy_route["supervision_deadline_generation"] == 0
+        assert legacy_route["supervision_attempts"] == 0
 
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}

@@ -185,6 +185,81 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+def _supervision_wake_payload(wake: Any, board: Optional[str]) -> dict[str, Any]:
+    """Serializable lease identity carried to the exact gateway turn."""
+    return {
+        "task_id": wake.task_id,
+        "creator_profile": wake.creator_profile,
+        "creator_session_id": wake.creator_session_id,
+        "pending_event_id": int(wake.pending_event_id),
+        "deadline_generation": int(wake.deadline_generation),
+        "lease_token": wake.lease_token,
+        "board": board,
+    }
+
+
+def _supervision_wake_text(task: Any, wake: Any, board: Optional[str]) -> str:
+    """Bounded creator-turn prompt for an event or the no-event deadline."""
+    title = (getattr(task, "title", None) or wake.task_id)[:120]
+    if wake.event is None:
+        reason = (
+            "the five-minute no-event deadline became due "
+            f"(generation {wake.deadline_generation})"
+        )
+    else:
+        reason = f"event {wake.event.id} ({wake.event.kind}) arrived"
+    board_hint = f" on board {board}" if board else ""
+    return (
+        f"[Automatic Kanban supervision] Self-owned task {wake.task_id} "
+        f"({title}){board_hint} needs its creator's supervision because {reason}. "
+        "Inspect the canonical task, current run, and recent events. Continue only "
+        "the existing mission; never recreate or reassign it. Leave the card done, "
+        "typed-blocked, or with the next bounded step recorded."
+    )
+
+
+def _supervision_source(plat: Any, sub: dict, profile: str, adapter: Any) -> Any:
+    """Rebuild the exact gateway source persisted on a supervision route."""
+    from gateway.session import SessionSource
+
+    chat_type = str(sub.get("chat_type") or "").strip()
+    if not chat_type:
+        delivery_meta = sub.get("delivery_metadata")
+        if isinstance(delivery_meta, dict):
+            chat_type = str(delivery_meta.get("chat_type") or "").strip()
+    return SessionSource(
+        platform=plat,
+        chat_id=sub["chat_id"],
+        chat_type=chat_type or "group",
+        thread_id=sub.get("thread_id") or None,
+        user_id=sub.get("user_id"),
+        user_id_alt=sub.get("user_id_alt"),
+        profile=profile or None,
+        scope_id=_wake_scope_id(adapter, sub),
+    )
+
+
+def _supervision_adapter_session_key(adapter: Any, source: Any) -> str:
+    from gateway.session import build_session_key
+
+    adapter_config = getattr(adapter, "config", None)
+    config_extra = getattr(adapter_config, "extra", {}) or {}
+    return build_session_key(
+        source,
+        group_sessions_per_user=config_extra.get(
+            "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=config_extra.get(
+            "thread_sessions_per_user", False
+        ),
+        profile=(
+            adapter._session_key_profile(source)
+            if hasattr(adapter, "_session_key_profile")
+            else source.profile
+        ),
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -454,6 +529,67 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    supervision_session_id = str(
+                                        sub.get("supervision_session_id") or ""
+                                    ).strip()
+                                    if supervision_session_id:
+                                        if not owner_profile:
+                                            logger.warning(
+                                                "kanban notifier: supervised route for %s has no creator profile; skipping",
+                                                sub.get("task_id"),
+                                            )
+                                            continue
+                                        # Do this before acquiring/replacing a
+                                        # lease. A long-running creator turn
+                                        # may outlive the DB lease; replacing
+                                        # its token while the exact session is
+                                        # still healthy would force a duplicate
+                                        # turn after the first CAS fails.
+                                        try:
+                                            supervision_plat = _Platform(platform)
+                                            supervision_adapter = self._authorization_adapter(
+                                                supervision_plat,
+                                                owner_profile,
+                                            )
+                                            active_sessions = getattr(
+                                                supervision_adapter,
+                                                "_active_sessions",
+                                                None,
+                                            )
+                                            if isinstance(active_sessions, dict):
+                                                supervision_source = _supervision_source(
+                                                    supervision_plat,
+                                                    sub,
+                                                    owner_profile,
+                                                    supervision_adapter,
+                                                )
+                                                if _supervision_adapter_session_key(
+                                                    supervision_adapter,
+                                                    supervision_source,
+                                                ) in active_sessions:
+                                                    continue
+                                        except Exception:
+                                            # Availability/routing is checked
+                                            # again on delivery. A failed busy
+                                            # probe must not disable recovery.
+                                            pass
+                                        wake = _kb.poll_supervision_wake(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            creator_profile=owner_profile,
+                                            creator_session_id=supervision_session_id,
+                                        )
+                                        if wake is None:
+                                            continue
+                                        task = _kb.get_task(conn, sub["task_id"])
+                                        deliveries.append({
+                                            "sub": sub,
+                                            "events": [wake.event] if wake.event else [],
+                                            "task": task,
+                                            "board": slug,
+                                            "supervision_wake": wake,
+                                        })
+                                        continue
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
@@ -541,6 +677,69 @@ class GatewayKanbanWatchersMixin:
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
+                    supervision_wake = d.get("supervision_wake")
+                    if supervision_wake is not None:
+                        from gateway.wake import adapter_supports_push, deliver_wake
+
+                        synth = _supervision_wake_text(
+                            task, supervision_wake, board_slug,
+                        )
+                        supervision_payload = _supervision_wake_payload(
+                            supervision_wake, board_slug,
+                        )
+                        try:
+                            if adapter_supports_push(adapter):
+                                from gateway.platforms.base import MessageEvent, MessageType
+                                source = _supervision_source(
+                                    plat, sub, sub_profile, adapter,
+                                )
+                                active_sessions = getattr(
+                                    adapter, "_active_sessions", None
+                                )
+                                if isinstance(active_sessions, dict):
+                                    session_key = _supervision_adapter_session_key(
+                                        adapter, source,
+                                    )
+                                    if session_key in active_sessions:
+                                        logger.debug(
+                                            "kanban notifier: creator session busy for supervised task %s; leaving lease unfinalized",
+                                            sub["task_id"],
+                                        )
+                                        continue
+                                event = MessageEvent(
+                                    text=synth,
+                                    message_type=MessageType.TEXT,
+                                    source=source,
+                                    internal=True,
+                                    metadata={
+                                        "kanban_supervision": supervision_payload,
+                                    },
+                                )
+                                await adapter.handle_message(event)
+                            else:
+                                await deliver_wake(
+                                    adapter,
+                                    text=synth,
+                                    session_id=supervision_wake.creator_session_id,
+                                )
+                                await self._finalize_kanban_supervision_turn(
+                                    supervision_payload,
+                                    disposition="complete",
+                                )
+                            logger.info(
+                                "kanban notifier: dispatched supervised creator turn for %s profile=%s event=%s",
+                                sub["task_id"],
+                                sub_profile or "default",
+                                supervision_wake.pending_event_id,
+                            )
+                        except Exception as exc:
+                            # The lease and ACK cursor deliberately remain as-is.
+                            # Another watcher redelivers after lease expiry.
+                            logger.warning(
+                                "kanban notifier: supervised wake dispatch failed for %s: %s",
+                                sub["task_id"], exc, exc_info=True,
+                            )
+                        continue
                     # Worker handoff carried into the synthetic wake turn below
                     # (#70752): without it the woken creator only sees
                     # "Task X completed" and re-decomposes work that already
@@ -1054,6 +1253,48 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    async def _finalize_kanban_supervision_turn(
+        self,
+        supervision: dict[str, Any],
+        *,
+        disposition: str,
+    ) -> bool:
+        """Finalize a completed creator turn through the lease-token CAS."""
+        def _finalize() -> bool:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect(board=supervision.get("board"))
+            try:
+                return _kb.finalize_supervision_wake(
+                    conn,
+                    task_id=str(supervision.get("task_id") or ""),
+                    creator_profile=str(
+                        supervision.get("creator_profile") or ""
+                    ),
+                    creator_session_id=str(
+                        supervision.get("creator_session_id") or ""
+                    ),
+                    lease_token=str(supervision.get("lease_token") or ""),
+                    disposition=disposition,
+                )
+            finally:
+                conn.close()
+
+        try:
+            finalized = bool(await _to_thread_process_service(_finalize))
+        except Exception as exc:
+            logger.warning(
+                "kanban supervision finalization failed for %s: %s",
+                supervision.get("task_id"), exc, exc_info=True,
+            )
+            return False
+        if not finalized:
+            logger.info(
+                "kanban supervision lease no longer current for %s; receipt not written",
+                supervision.get("task_id"),
+            )
+        return finalized
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb

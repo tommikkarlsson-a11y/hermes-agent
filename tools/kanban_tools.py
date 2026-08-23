@@ -137,6 +137,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_owner_mode() -> bool:
+    """Owner tools are session-granted and never valid in child/worker/cron runs."""
+    if _is_delegated_child_context() or os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env("HERMES_CRON_SESSION", "") != "1"
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -291,6 +303,265 @@ def _connect(board: Optional[str] = None):
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
+
+
+_OWNER_CREATE_FIELDS = frozenset({
+    "title", "body", "acceptance", "mission_key", "max_runtime_seconds",
+    "goal_max_turns", "max_retries",
+})
+
+
+def _reject_owner_authority_fields(args: dict, allowed: set[str] | frozenset[str]) -> Optional[str]:
+    unknown = sorted(set(args) - set(allowed))
+    if not unknown:
+        return None
+    return tool_error(
+        "unsupported authority field(s) for kanban-owner: " + ", ".join(unknown)
+    )
+
+
+def _owner_identity(**kw) -> tuple[Optional[dict[str, str]], Optional[str]]:
+    delegated = _reject_delegated_child_mutation("kanban-owner")
+    if delegated:
+        return None, delegated
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None, tool_error(
+            "kanban-owner is unavailable inside dispatcher-owned worker runs"
+        )
+    try:
+        from gateway.session_context import get_session_env
+
+        bound_session = get_session_env("HERMES_SESSION_ID", "").strip()
+        dispatch_session = str(kw.get("session_id") or "").strip()
+        if bound_session and dispatch_session and bound_session != dispatch_session:
+            return None, tool_error("creator session identity mismatch")
+        session_id = dispatch_session or bound_session
+        profile = get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        if not profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+
+                inferred = get_active_profile_name()
+                profile = "" if inferred == "custom" else inferred
+            except Exception:
+                profile = ""
+        profile = profile or str(os.environ.get("HERMES_PROFILE") or "").strip()
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+        source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
+        session_key = get_session_env("HERMES_SESSION_KEY", "").strip()
+        if not platform or not chat_id:
+            if source in {"tui", "desktop", "gui"} and session_key:
+                platform, chat_id = "tui", session_key
+            elif session_key:
+                platform, chat_id = "tui", session_key
+        if not profile or not session_id or not platform or not chat_id:
+            return None, tool_error(
+                "kanban-owner requires an attached profile, durable session, and route"
+            )
+        return {
+            "profile": profile,
+            "session_id": session_id,
+            "platform": platform,
+            "chat_id": chat_id,
+            "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", "").strip(),
+            "user_id": get_session_env("HERMES_SESSION_USER_ID", "").strip(),
+            "user_id_alt": get_session_env("HERMES_SESSION_USER_ID_ALT", "").strip(),
+            "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE", "").strip() or "dm",
+        }, None
+    except Exception as exc:
+        return None, tool_error(f"kanban-owner identity unavailable: {exc}")
+
+
+def _owned_supervision_task(kb, conn, task_id: str, identity: dict[str, str]):
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return None
+    if not (
+        task.session_id == identity["session_id"]
+        and task.created_by == identity["profile"]
+        and task.assignee == identity["profile"]
+    ):
+        return None
+    route = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+        "AND notifier_profile = ? AND supervision_session_id = ? LIMIT 1",
+        (task_id, identity["profile"], identity["session_id"]),
+    ).fetchone()
+    return task if route is not None else None
+
+
+def _handle_create_self_owned(args: dict, **kw) -> str:
+    escape = _reject_owner_authority_fields(args, _OWNER_CREATE_FIELDS)
+    if escape:
+        return escape
+    identity, identity_error = _owner_identity(**kw)
+    if identity_error:
+        return identity_error
+    assert identity is not None
+    title = str(args.get("title") or "").strip()
+    acceptance = str(args.get("acceptance") or "").strip()
+    mission_key = str(args.get("mission_key") or "").strip()
+    if not title or not acceptance or not mission_key:
+        return tool_error("title, acceptance, and mission_key are required")
+    try:
+        kb, conn = _connect()
+        try:
+            board = kb.get_current_board()
+            task_id = kb.create_supervised_task(
+                conn,
+                title=title,
+                body=(
+                    redact_sensitive_text(str(args.get("body")), force=True)
+                    if args.get("body") else None
+                ),
+                acceptance=redact_sensitive_text(acceptance, force=True),
+                creator_profile=identity["profile"],
+                creator_session_id=identity["session_id"],
+                platform=identity["platform"],
+                chat_id=identity["chat_id"],
+                thread_id=identity["thread_id"],
+                user_id=identity["user_id"],
+                user_id_alt=identity["user_id_alt"],
+                chat_type=identity["chat_type"],
+                mission_key=mission_key,
+                max_runtime_seconds=int(args.get("max_runtime_seconds", 8 * 60 * 60)),
+                goal_max_turns=int(args.get("goal_max_turns", 12)),
+                max_retries=int(args.get("max_retries", 2)),
+                board=board,
+            )
+            task = kb.get_task(conn, task_id)
+            return _ok(
+                task_id=task_id,
+                status=task.status if task else None,
+                assignee=identity["profile"],
+                board=board,
+                supervised=True,
+            )
+        finally:
+            conn.close()
+    except (TypeError, ValueError) as exc:
+        return tool_error(f"kanban_create_self_owned: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_create_self_owned failed")
+        return tool_error(f"kanban_create_self_owned: {exc}")
+
+
+def _handle_show_self_owned(args: dict, **kw) -> str:
+    escape = _reject_owner_authority_fields(args, {"task_id"})
+    if escape:
+        return escape
+    identity, identity_error = _owner_identity(**kw)
+    if identity_error:
+        return identity_error
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return tool_error("task_id is required")
+    assert identity is not None
+    kb, conn = _connect()
+    try:
+        task = _owned_supervision_task(kb, conn, task_id, identity)
+        if task is None:
+            return tool_error(
+                f"task {task_id} is not owned by this exact creator session"
+            )
+        return json.dumps({
+            "task": {
+                "id": task.id,
+                "title": task.title,
+                "body": task.body,
+                "status": task.status,
+                "assignee": task.assignee,
+                "created_by": task.created_by,
+                "session_id": task.session_id,
+                "current_run_id": task.current_run_id,
+                "block_kind": task.block_kind,
+            },
+            "comments": [
+                {"author": comment.author, "body": comment.body,
+                 "created_at": comment.created_at}
+                for comment in kb.list_comments(conn, task_id)
+            ],
+            "events": [
+                {"id": event.id, "kind": event.kind, "payload": event.payload,
+                 "run_id": event.run_id, "created_at": event.created_at}
+                for event in kb.list_events(conn, task_id)[-50:]
+            ],
+            "runs": [
+                {"id": run.id, "profile": run.profile, "status": run.status,
+                 "outcome": run.outcome, "summary": run.summary,
+                 "error": run.error, "started_at": run.started_at,
+                 "ended_at": run.ended_at}
+                for run in kb.list_runs(conn, task_id)
+            ],
+        })
+    finally:
+        conn.close()
+
+
+def _handle_comment_self_owned(args: dict, **kw) -> str:
+    escape = _reject_owner_authority_fields(args, {"task_id", "body"})
+    if escape:
+        return escape
+    identity, identity_error = _owner_identity(**kw)
+    if identity_error:
+        return identity_error
+    task_id = str(args.get("task_id") or "").strip()
+    body = str(args.get("body") or "").strip()
+    if not task_id or not body:
+        return tool_error("task_id and body are required")
+    assert identity is not None
+    kb, conn = _connect()
+    try:
+        if _owned_supervision_task(kb, conn, task_id, identity) is None:
+            return tool_error(
+                f"task {task_id} is not owned by this exact creator session"
+            )
+        comment_id = kb.add_comment(
+            conn,
+            task_id,
+            author=identity["profile"],
+            body=redact_sensitive_text(body, force=True),
+        )
+        return _ok(task_id=task_id, comment_id=comment_id)
+    finally:
+        conn.close()
+
+
+def _handle_block_self_owned(args: dict, **kw) -> str:
+    escape = _reject_owner_authority_fields(args, {"task_id", "reason", "kind"})
+    if escape:
+        return escape
+    identity, identity_error = _owner_identity(**kw)
+    if identity_error:
+        return identity_error
+    task_id = str(args.get("task_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    kind = str(args.get("kind") or "").strip()
+    if not task_id or not reason or not kind:
+        return tool_error("task_id, typed kind, and reason are required")
+    if kind not in {"needs_input", "capability", "transient"}:
+        return tool_error("kind must be needs_input, capability, or transient")
+    assert identity is not None
+    kb, conn = _connect()
+    try:
+        if _owned_supervision_task(kb, conn, task_id, identity) is None:
+            return tool_error(
+                f"task {task_id} is not owned by this exact creator session"
+            )
+        blocked, failure = kb.block_self_owned_supervision(
+            conn,
+            task_id=task_id,
+            creator_profile=identity["profile"],
+            creator_session_id=identity["session_id"],
+            reason=reason,
+            kind=kind,
+        )
+        if not blocked:
+            return tool_error(failure or f"could not block {task_id}")
+        return _ok(task_id=task_id, status="blocked", block_kind=kind)
+    finally:
+        conn.close()
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
@@ -2429,6 +2700,87 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_CREATE_SELF_OWNED_SCHEMA = {
+    "name": "kanban_create_self_owned",
+    "description": (
+        "Create one bounded, supervised mission owned by this exact Bot Chat "
+        "profile and durable session. Identity, assignee, board, workspace, "
+        "routing, model, skills, parents, and initial status are server-derived."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "Short mission title."},
+            "body": {"type": "string", "description": "Bounded mission instructions."},
+            "acceptance": {
+                "type": "string",
+                "description": "Concrete evidence required before the mission is done.",
+            },
+            "mission_key": {
+                "type": "string",
+                "description": "Retry-safe key scoped to this exact profile and session.",
+            },
+            "max_runtime_seconds": {
+                "type": "integer", "minimum": 60, "maximum": 28800,
+            },
+            "goal_max_turns": {
+                "type": "integer", "minimum": 1, "maximum": 20,
+            },
+            "max_retries": {
+                "type": "integer", "minimum": 1, "maximum": 3,
+            },
+        },
+        "required": ["title", "acceptance", "mission_key"],
+        "additionalProperties": False,
+    },
+}
+
+KANBAN_SHOW_SELF_OWNED_SCHEMA = {
+    "name": "kanban_show_self_owned",
+    "description": "Show the exact supervised mission owned by this creator session.",
+    "parameters": {
+        "type": "object",
+        "properties": {"task_id": {"type": "string"}},
+        "required": ["task_id"],
+        "additionalProperties": False,
+    },
+}
+
+KANBAN_COMMENT_SELF_OWNED_SCHEMA = {
+    "name": "kanban_comment_self_owned",
+    "description": "Comment on the exact supervised mission owned by this creator session.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "body": {"type": "string"},
+        },
+        "required": ["task_id", "body"],
+        "additionalProperties": False,
+    },
+}
+
+KANBAN_BLOCK_SELF_OWNED_SCHEMA = {
+    "name": "kanban_block_self_owned",
+    "description": (
+        "Terminally block the exact supervised mission owned by this creator "
+        "session, only when no valid same-profile worker is live."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string"},
+            "reason": {"type": "string"},
+            "kind": {
+                "type": "string",
+                "enum": ["needs_input", "capability", "transient"],
+            },
+        },
+        "required": ["task_id", "reason", "kind"],
+        "additionalProperties": False,
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2558,4 +2910,40 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_create_self_owned",
+    toolset="kanban-owner",
+    schema=KANBAN_CREATE_SELF_OWNED_SCHEMA,
+    handler=_handle_create_self_owned,
+    check_fn=_check_kanban_owner_mode,
+    emoji="➕",
+)
+
+registry.register(
+    name="kanban_show_self_owned",
+    toolset="kanban-owner",
+    schema=KANBAN_SHOW_SELF_OWNED_SCHEMA,
+    handler=_handle_show_self_owned,
+    check_fn=_check_kanban_owner_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_comment_self_owned",
+    toolset="kanban-owner",
+    schema=KANBAN_COMMENT_SELF_OWNED_SCHEMA,
+    handler=_handle_comment_self_owned,
+    check_fn=_check_kanban_owner_mode,
+    emoji="💬",
+)
+
+registry.register(
+    name="kanban_block_self_owned",
+    toolset="kanban-owner",
+    schema=KANBAN_BLOCK_SELF_OWNED_SCHEMA,
+    handler=_handle_block_self_owned,
+    check_fn=_check_kanban_owner_mode,
+    emoji="⏸",
 )

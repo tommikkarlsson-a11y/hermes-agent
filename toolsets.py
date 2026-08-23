@@ -333,6 +333,20 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "kanban-owner": {
+        "description": (
+            "Narrow self-owned Kanban mission intake and supervision for an "
+            "attached Bot Chat session"
+        ),
+        "tools": [
+            "kanban_create_self_owned",
+            "kanban_show_self_owned",
+            "kanban_comment_self_owned",
+            "kanban_block_self_owned",
+        ],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

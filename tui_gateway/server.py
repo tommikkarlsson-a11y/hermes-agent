@@ -9905,6 +9905,78 @@ _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
 
+class _KanbanSupervisionNotification(NamedTuple):
+    text: str
+    claim: Any
+    board: str
+
+
+def _supervision_notification_text(task: Any, claim: Any, board: str) -> str:
+    title = (getattr(task, "title", None) or claim.task_id)[:120]
+    if claim.event is None:
+        reason = (
+            "the five-minute no-event deadline became due "
+            f"(generation {claim.deadline_generation})"
+        )
+    else:
+        reason = f"event {claim.event.id} ({claim.event.kind}) arrived"
+    board_hint = f" on board {board}" if board else ""
+    return (
+        f"[Automatic Kanban supervision] Self-owned task {claim.task_id} "
+        f"({title}){board_hint} needs its creator's supervision because {reason}. "
+        "Inspect the canonical task, current run, and recent events. Continue only "
+        "the existing mission; never recreate or reassign it. Leave the card done, "
+        "typed-blocked, or with the next bounded step recorded."
+    )
+
+
+def _finalize_tui_kanban_supervision(
+    session: dict,
+    notice: _KanbanSupervisionNotification,
+    *,
+    disposition: str,
+    turn_session_id: str,
+) -> bool:
+    """Post-turn lease-token CAS; failures leave the wake redeliverable."""
+    claim = notice.claim
+    if turn_session_id != claim.creator_session_id:
+        logger.warning(
+            "TUI kanban supervision session changed from %s to %s; leaving lease unfinalized",
+            claim.creator_session_id,
+            turn_session_id,
+        )
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=notice.board)
+        try:
+            finalized = _kb.finalize_supervision_wake(
+                conn,
+                task_id=claim.task_id,
+                creator_profile=claim.creator_profile,
+                creator_session_id=claim.creator_session_id,
+                lease_token=claim.lease_token,
+                disposition=disposition,
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning(
+            "TUI kanban supervision finalization failed for %s: %s",
+            claim.task_id,
+            exc,
+            exc_info=True,
+        )
+        return False
+    if not finalized:
+        logger.info(
+            "TUI kanban supervision lease no longer current for %s; receipt not written",
+            claim.task_id,
+        )
+    return bool(finalized)
+
+
 def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     """Fire a due /loop wakeup for an idle TUI/Desktop/dashboard session.
 
@@ -10045,6 +10117,16 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     return None
 
 
+def _tui_supervision_session_id(session: dict) -> str:
+    agent = session.get("agent")
+    return str(getattr(agent, "session_id", None) or "").strip()
+
+
+def _tui_supervision_profile(session: dict) -> str:
+    profile_home = str(session.get("profile_home") or "").strip()
+    return Path(profile_home).name if profile_home else _current_profile_name()
+
+
 def _collect_kanban_notifications(session: dict) -> list:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
@@ -10054,8 +10136,9 @@ def _collect_kanban_notifications(session: dict) -> list:
     can't deliver those — there is no "tui" messaging adapter — so this
     poller is the delivery path for them (issue #59890). Uses the same
     atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    notifier for legacy rows. Supervised rows use ``poll_supervision_wake``;
+    their cursor stays behind the leased event until the exact creator turn's
+    post-turn finalizer writes its receipt and ACK through lease-token CAS.
 
     Returns the list of formatted notification texts (may be empty).
     """
@@ -10118,6 +10201,51 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
                 if sub.get("chat_id") != session_key:
+                    continue
+                supervision_session_id = str(
+                    sub.get("supervision_session_id") or ""
+                ).strip()
+                if supervision_session_id:
+                    # An attached TUI owner route is exact-session authority.
+                    # Never let a chat-id collision adopt another durable
+                    # creator session's supervision lease.
+                    if supervision_session_id != _tui_supervision_session_id(session):
+                        continue
+                    active_notice = session.get("_kanban_supervision_active")
+                    if (
+                        isinstance(
+                            active_notice, _KanbanSupervisionNotification
+                        )
+                        and active_notice.claim.task_id == sub["task_id"]
+                    ):
+                        # A live creator turn owns this lease even if its DB
+                        # expiry passes. Process death drops this in-memory
+                        # marker, so the expired lease remains redeliverable.
+                        continue
+                    creator_profile = str(
+                        sub.get("notifier_profile") or ""
+                    ).strip()
+                    if not creator_profile:
+                        continue
+                    session_profile = _tui_supervision_profile(session)
+                    if session_profile != creator_profile:
+                        continue
+                    claim = _kb.poll_supervision_wake(
+                        conn,
+                        task_id=sub["task_id"],
+                        creator_profile=creator_profile,
+                        creator_session_id=supervision_session_id,
+                    )
+                    if claim is None:
+                        continue
+                    task = _kb.get_task(conn, sub["task_id"])
+                    texts.append(
+                        _KanbanSupervisionNotification(
+                            text=_supervision_notification_text(task, claim, slug),
+                            claim=claim,
+                            board=slug,
+                        )
+                    )
                     continue
                 _old, _new, events = _kb.claim_unseen_events_for_sub(
                     conn,
@@ -10205,7 +10333,12 @@ def _notification_poller_loop(
                 )
                 _kanban_texts = []
             if _kanban_texts:
-                for _kb_text in _kanban_texts:
+                for _kb_notice in _kanban_texts:
+                    _kb_text = (
+                        _kb_notice.text
+                        if isinstance(_kb_notice, _KanbanSupervisionNotification)
+                        else _kb_notice
+                    )
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
                 # Events are cursor-claimed (never re-queued), so buffer them
                 # until the session is idle instead of dropping the agent turn.
@@ -10216,13 +10349,43 @@ def _notification_poller_loop(
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
+                        if isinstance(
+                            _pending[0], _KanbanSupervisionNotification
+                        ):
+                            # One lease maps to exactly one creator turn and one
+                            # post-turn receipt. Never batch two lease tokens.
+                            _batch = [_pending[0]]
+                            session["_kanban_pending"] = list(_pending[1:])
+                        else:
+                            # Preserve the legacy all-text batching behavior.
+                            split = next(
+                                (
+                                    i for i, item in enumerate(_pending)
+                                    if isinstance(
+                                        item, _KanbanSupervisionNotification
+                                    )
+                                ),
+                                len(_pending),
+                            )
+                            _batch = list(_pending[:split])
+                            session["_kanban_pending"] = list(_pending[split:])
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        first = _batch[0]
+                        if isinstance(first, _KanbanSupervisionNotification):
+                            _run_prompt_submit(
+                                rid,
+                                sid,
+                                session,
+                                first.text,
+                                kanban_supervision=first,
+                            )
+                        else:
+                            _run_prompt_submit(
+                                rid, sid, session, "\n".join(_batch)
+                            )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -10734,8 +10897,18 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    kanban_supervision: _KanbanSupervisionNotification | None = None,
 ) -> bool:
+    supervision_turn_session_id = _tui_supervision_session_id(session)
     with session["history_lock"]:
+        if kanban_supervision is not None and (
+            supervision_turn_session_id
+            != kanban_supervision.claim.creator_session_id
+            or _tui_supervision_profile(session)
+            != kanban_supervision.claim.creator_profile
+        ):
+            session["running"] = False
+            return False
         if session.get("_closing"):
             session["running"] = False
             return False
@@ -11479,6 +11652,14 @@ def _run_prompt_submit(
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
+
+            if kanban_supervision is not None and status == "complete":
+                _finalize_tui_kanban_supervision(
+                    session,
+                    kanban_supervision,
+                    disposition=status,
+                    turn_session_id=supervision_turn_session_id,
+                )
         except Exception as e:
             import traceback
 
@@ -11571,6 +11752,12 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                if (
+                    kanban_supervision is not None
+                    and session.get("_kanban_supervision_active")
+                    is kanban_supervision
+                ):
+                    session.pop("_kanban_supervision_active", None)
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of the "tui prompt accepted" record above —
@@ -11709,7 +11896,18 @@ def _run_prompt_submit(
         )
         if can_start:
             session["_run_thread"] = run_thread
-            run_thread.start()
+            if kanban_supervision is not None:
+                session["_kanban_supervision_active"] = kanban_supervision
+            try:
+                run_thread.start()
+            except Exception:
+                if kanban_supervision is not None:
+                    if (
+                        session.get("_kanban_supervision_active")
+                        is kanban_supervision
+                    ):
+                        session.pop("_kanban_supervision_active", None)
+                raise
     if not can_start:
         with session["history_lock"]:
             session["running"] = False

@@ -13,6 +13,8 @@ unsubscribe) and ``_format_kanban_event_text``.
 
 from types import SimpleNamespace
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
@@ -24,7 +26,10 @@ SESSION_KEY = "tui-session-key-1"
 
 
 def _session(key: str = SESSION_KEY) -> dict:
-    return {"session_key": key}
+    return {
+        "session_key": key,
+        "agent": SimpleNamespace(session_id=key),
+    }
 
 
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
@@ -360,3 +365,336 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+
+def test_supervised_tui_turn_finalizes_only_after_run_returns(tmp_path, monkeypatch):
+    import threading
+    import tui_gateway.server as server
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_supervised_task(
+            conn,
+            title="TUI supervision",
+            body=None,
+            acceptance="ACK only after the creator turn returns.",
+            creator_profile="default",
+            creator_session_id=SESSION_KEY,
+            platform="tui",
+            chat_id=SESSION_KEY,
+            mission_key="tui-runtime",
+            max_runtime_seconds=600,
+            goal_max_turns=4,
+            max_retries=1,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "timed_out", {"attempt": 1})
+        event_id = kb.list_events(conn, task_id)[-1].id
+
+    notices = _collect_kanban_notifications(_session())
+    assert len(notices) == 1
+    notice = notices[0]
+    assert notice.claim.pending_event_id == event_id
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["last_event_id"] < event_id
+        assert route["supervision_lease_token"] == notice.claim.lease_token
+
+    release_turn = threading.Event()
+    turn_started = threading.Event()
+
+    class _Agent:
+        session_id = SESSION_KEY
+        interim_assistant_callback = None
+
+        def run_conversation(self, *args, **kwargs):
+            turn_started.set()
+            assert release_turn.wait(timeout=5)
+            return {
+                "final_response": "Supervision complete.",
+                "messages": [{"role": "assistant", "content": "done"}],
+            }
+
+    session = {
+        "agent": _Agent(),
+        "session_key": SESSION_KEY,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "attached_images": [],
+        "cols": 80,
+    }
+    server._sessions["sid-supervision"] = session
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        assert server._run_prompt_submit(
+            "rid-supervision",
+            "sid-supervision",
+            session,
+            notice.text,
+            kanban_supervision=notice,
+        )
+        assert turn_started.wait(timeout=5)
+        with kb.connect_closing() as conn:
+            route = kb.list_notify_subs(conn, task_id)[0]
+            assert route["last_event_id"] < event_id
+            assert not any(
+                event.kind == "supervision_receipt"
+                for event in kb.list_events(conn, task_id)
+            )
+            conn.execute(
+                "UPDATE kanban_notify_subs SET supervision_lease_expires_at = 0 "
+                "WHERE task_id = ?",
+                (task_id,),
+            )
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "crashed", {"attempt": 2})
+            mid_turn_event_id = kb.list_events(conn, task_id)[-1].id
+        assert _collect_kanban_notifications(session) == []
+
+        release_turn.set()
+        session["_run_thread"].join(timeout=10)
+        assert not session["_run_thread"].is_alive()
+    finally:
+        release_turn.set()
+        server._sessions.pop("sid-supervision", None)
+
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["last_event_id"] == event_id
+        assert route["supervision_pending_event_id"] is None
+        assert route["supervision_lease_token"] is None
+        receipts = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "supervision_receipt"
+        ]
+        assert len(receipts) == 1
+
+    # Finalization ACKs only the leased event. The event appended while the
+    # creator turn was running remains above the cursor and is the next claim.
+    next_notice = _collect_kanban_notifications(_session())
+    assert len(next_notice) == 1
+    assert next_notice[0].claim.pending_event_id == mid_turn_event_id
+
+
+def test_supervised_tui_uses_durable_session_id_not_routing_key():
+    durable_session_id = "durable-session-id"
+    with kb.connect_closing() as conn:
+        task_id = kb.create_supervised_task(
+            conn,
+            title="Durable TUI identity",
+            body=None,
+            acceptance="The routing key cannot replace durable identity.",
+            creator_profile="default",
+            creator_session_id=durable_session_id,
+            platform="tui",
+            chat_id=SESSION_KEY,
+            mission_key="durable-tui-identity",
+            max_runtime_seconds=600,
+            goal_max_turns=4,
+            max_retries=1,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "crashed", {"attempt": 1})
+
+    matching = _session()
+    matching["agent"].session_id = durable_session_id
+    notices = _collect_kanban_notifications(matching)
+    assert len(notices) == 1
+
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE kanban_notify_subs SET supervision_lease_expires_at = 0 "
+            "WHERE task_id = ?",
+            (task_id,),
+        )
+    rebound = _session()
+    rebound["agent"].session_id = "rebound-session"
+    assert _collect_kanban_notifications(rebound) == []
+
+
+def test_tui_interrupted_supervision_turn_leaves_lease_unacked(tmp_path, monkeypatch):
+    import threading
+    import tui_gateway.server as server
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_supervised_task(
+            conn,
+            title="Interrupted TUI supervision",
+            body=None,
+            acceptance="Interrupted turns are redelivered.",
+            creator_profile="default",
+            creator_session_id=SESSION_KEY,
+            platform="tui",
+            chat_id=SESSION_KEY,
+            mission_key="tui-interrupted",
+            max_runtime_seconds=600,
+            goal_max_turns=4,
+            max_retries=1,
+        )
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "crashed", {"attempt": 1})
+        event_id = kb.list_events(conn, task_id)[-1].id
+    notice = _collect_kanban_notifications(_session())[0]
+
+    class _Agent:
+        session_id = SESSION_KEY
+        interim_assistant_callback = None
+
+        def run_conversation(self, *args, **kwargs):
+            return {"interrupted": True, "messages": []}
+
+    session = {
+        "agent": _Agent(),
+        "session_key": SESSION_KEY,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": True,
+        "attached_images": [],
+        "cols": 80,
+    }
+    server._sessions["sid-interrupted-supervision"] = session
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    try:
+        assert server._run_prompt_submit(
+            "rid-interrupted",
+            "sid-interrupted-supervision",
+            session,
+            notice.text,
+            kanban_supervision=notice,
+        )
+        session["_run_thread"].join(timeout=10)
+        assert not session["_run_thread"].is_alive()
+    finally:
+        server._sessions.pop("sid-interrupted-supervision", None)
+
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["last_event_id"] < event_id
+        assert route["supervision_pending_event_id"] == event_id
+        assert route["supervision_lease_token"] == notice.claim.lease_token
+
+
+def test_supervised_tui_deadline_claim_is_single_owner_and_redelivers_after_death():
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        task_id = kb.create_supervised_task(
+            conn,
+            title="Deadline redelivery",
+            body=None,
+            acceptance="One watcher owns each deadline lease.",
+            creator_profile="default",
+            creator_session_id=SESSION_KEY,
+            platform="tui",
+            chat_id=SESSION_KEY,
+            mission_key="deadline-redelivery",
+            max_runtime_seconds=600,
+            goal_max_turns=4,
+            max_retries=1,
+            now=now - kb.SUPERVISION_DEADLINE_SECONDS - 1,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _: _collect_kanban_notifications(_session()), range(2))
+        )
+    notices = [notice for result in results for notice in result]
+    assert len(notices) == 1
+    first = notices[0]
+    assert first.claim.pending_event_id == 0
+    assert first.claim.event is None
+
+    # Invocation never happened and therefore no ACK/receipt exists. Simulate
+    # watcher death by expiring the lease; the same deadline unit is claimed
+    # again with a fresh token and incremented attempt.
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        initial_cursor = route["last_event_id"]
+        conn.execute(
+            "UPDATE kanban_notify_subs SET supervision_lease_expires_at = 0 "
+            "WHERE task_id = ?",
+            (task_id,),
+        )
+    redelivered = _collect_kanban_notifications(_session())
+    assert len(redelivered) == 1
+    assert redelivered[0].claim.pending_event_id == 0
+    assert redelivered[0].claim.lease_token != first.claim.lease_token
+    assert redelivered[0].claim.attempt == 2
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["last_event_id"] == initial_cursor
+        assert not any(
+            event.kind == "supervision_receipt"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_supervised_tui_deadline_suppresses_only_healthy_exact_profile_worker(
+    monkeypatch,
+):
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        task_id = kb.create_supervised_task(
+            conn,
+            title="Healthy worker deadline",
+            body=None,
+            acceptance="Do not run owner chat concurrently with its worker.",
+            creator_profile="default",
+            creator_session_id=SESSION_KEY,
+            platform="tui",
+            chat_id=SESSION_KEY,
+            mission_key="healthy-deadline",
+            max_runtime_seconds=600,
+            goal_max_turns=4,
+            max_retries=1,
+            now=now - kb.SUPERVISION_DEADLINE_SECONDS - 1,
+        )
+        with kb.write_txn(conn):
+            run = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, claim_lock, "
+                "claim_expires, worker_pid, max_runtime_seconds, "
+                "last_heartbeat_at, started_at) "
+                "VALUES (?, 'default', 'running', 'host:4242', ?, 4242, "
+                "600, ?, ?)",
+                (task_id, now + 120, now, now - 10),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = 'host:4242', "
+                "claim_expires = ?, worker_pid = 4242, last_heartbeat_at = ?, "
+                "started_at = ?, current_run_id = ? WHERE id = ?",
+                (now + 120, now, now - 10, run.lastrowid, task_id),
+            )
+            kb._append_event(
+                conn, task_id, "claimed", {"claimer": "host:4242"},
+                run_id=run.lastrowid,
+            )
+            kb._append_event(
+                conn, task_id, "spawned", {"pid": 4242},
+                run_id=run.lastrowid,
+            )
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 4242)
+    assert _collect_kanban_notifications(_session()) == []
+    with kb.connect_closing() as conn:
+        route = kb.list_notify_subs(conn, task_id)[0]
+        assert route["supervision_deadline_at"] > now
+        assert route["supervision_lease_token"] is None
+        conn.execute(
+            "UPDATE task_runs SET profile = 'ops' WHERE id = ?",
+            (run.lastrowid,),
+        )
+        conn.execute(
+            "UPDATE kanban_notify_subs SET supervision_deadline_at = ? "
+            "WHERE task_id = ?",
+            (now - 1, task_id),
+        )
+
+    wake = _collect_kanban_notifications(_session())
+    assert len(wake) == 1
+    assert wake[0].claim.pending_event_id == 0
