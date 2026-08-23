@@ -593,7 +593,7 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [p for p in [launchd_pid, orphan_pid] if p not in (exclude_pids or set())],
+            lambda exclude_pids=None, **_kwargs: [p for p in [launchd_pid, orphan_pid] if p not in (exclude_pids or set())],
         )
 
         killed_pids = []
@@ -625,7 +625,7 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [p for p in [launchd_pid] if p not in (exclude_pids or set())],
+            lambda exclude_pids=None, **_kwargs: [p for p in [launchd_pid] if p not in (exclude_pids or set())],
         )
 
         killed_pids = []
@@ -684,7 +684,7 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 p
                 for p in [recorded_pid, bootstrap_pid, orphan_pid]
                 if p not in (exclude_pids or set())
@@ -727,7 +727,7 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 p
                 for p in [recorded_pid, bootstrap_pid]
                 if p not in (exclude_pids or set())
@@ -793,7 +793,7 @@ class TestReaperCandidateIsSupervisorOwned:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 p for p in [gateway_pid, bootstrap_pid, orphan_pid]
                 if p not in (exclude_pids or set())
             ],
@@ -834,7 +834,7 @@ class TestReaperCandidateIsSupervisorOwned:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 p for p in [orphan_pid] if p not in (exclude_pids or set())
             ],
         )
@@ -971,7 +971,7 @@ class TestWindowsScheduledTaskSupervisorGuard:
         monkeypatch.setattr(
             gateway,
             "find_gateway_pids",
-            lambda exclude_pids=None: [
+            lambda exclude_pids=None, **_kwargs: [
                 p for p in [orphan_pid] if p not in (exclude_pids or set())
             ],
         )

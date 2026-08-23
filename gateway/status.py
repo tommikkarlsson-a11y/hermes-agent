@@ -539,6 +539,16 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
     return looks_like_gateway_runtime_command_line(cmdline)
 
 
+def _record_looks_like_running_gateway(record: dict[str, Any]) -> bool:
+    """Validate strict gateway identity for user-facing health surfaces."""
+    if record.get("kind") != _GATEWAY_KIND:
+        return False
+    argv = record.get("argv")
+    if not isinstance(argv, list) or not argv:
+        return False
+    return looks_like_gateway_command_line(" ".join(str(part) for part in argv))
+
+
 def _profile_name_for_home(profile_home: Path) -> Optional[str]:
     """Return the profile id a HERMES_HOME directory represents, or None.
 
@@ -614,14 +624,14 @@ def _record_matches_live_gateway_pid(
     """
     live_cmdline = _read_process_cmdline(pid)
     if live_cmdline:
-        if not looks_like_gateway_runtime_command_line(live_cmdline):
+        if not looks_like_gateway_command_line(live_cmdline):
             return False
         if expected_home is not None and not _command_line_belongs_to_profile(
             live_cmdline, expected_home
         ):
             return False
         return True
-    return _record_looks_like_gateway(record)
+    return _record_looks_like_running_gateway(record)
 
 
 def _build_pid_record() -> dict:

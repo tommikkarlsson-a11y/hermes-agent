@@ -4657,7 +4657,13 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        running_pids = list(dict.fromkeys(find_gateway_pids(all_profiles=True)))
+        running_pids = list(
+            dict.fromkeys(
+                find_gateway_pids(
+                    all_profiles=True, include_restart_managers=True
+                )
+            )
+        )
     except Exception as exc:
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
@@ -4817,7 +4823,9 @@ def _cold_start_windows_gateway_after_update() -> None:
     # autostart entry may have already brought a gateway up, or a leftover
     # process may have re-registered. Don't double-start.
     try:
-        if list(find_gateway_pids(all_profiles=True)):
+        if list(
+            find_gateway_pids(all_profiles=True, include_restart_managers=True)
+        ):
             return
     except Exception as exc:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
@@ -5039,7 +5047,9 @@ def _surviving_gateway_pids_after_failed_restart():
     try:
         from hermes_cli.gateway import find_gateway_pids
 
-        return list(find_gateway_pids(all_profiles=True))
+        return list(
+            find_gateway_pids(all_profiles=True, include_restart_managers=True)
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not probe for surviving gateways after update: %s", exc)
         return None
@@ -7325,7 +7335,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # if the probe itself raises, leave the snapshot as-is (the
             # survivor probe's own None result already fails closed).
             try:
-                _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))
+                _pre_restart_gateway_pids = list(
+                    find_gateway_pids(
+                        all_profiles=True, include_restart_managers=True
+                    )
+                )
             except Exception:
                 _pre_restart_gateway_pids = None
 
@@ -7684,7 +7698,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # immediately kill the process that systemd/launchd just spawned.
             service_pids = _get_service_pids(all_profiles=True)
             manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
+                exclude_pids=service_pids,
+                all_profiles=True,
+                include_restart_managers=True,
             )
             profile_processes = {
                 proc.pid: proc
@@ -7839,6 +7855,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _surviving = find_gateway_pids(
                     exclude_pids=_service_pids_after,
                     all_profiles=True,
+                    include_restart_managers=True,
                 )
                 # Scope to PIDs we already tried to kill during this
                 # update (killed_pids).  Anything new is a gateway that
