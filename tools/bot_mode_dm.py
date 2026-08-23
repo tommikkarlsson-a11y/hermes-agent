@@ -302,7 +302,9 @@ def message_agent_tool(
     if resolved == me:
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
-    dm_file = _write_dm_file(prefix + body)
+    from agent.bot_advisory import EXPLICIT_ADVISORY_MARKER
+
+    dm_file = _write_dm_file(f"{EXPLICIT_ADVISORY_MARKER}\n{prefix}{body}")
     command = (
         f"hermes -p {shlex.quote(resolved)} chat --in ~ -c \"Bot Chat\" "
         f"--create-if-missing -Q --query-file {shlex.quote(dm_file)}"

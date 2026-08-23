@@ -102,7 +102,9 @@ def is_dispatcher_owned_worker_context() -> bool:
     before trusting those vars.  False for delegate_task children and for cron
     jobs fired in-process from a worker.
     """
-    if _DELEGATED_CHILD_CONTEXT.get():
+    from agent.bot_advisory import is_advisory_turn_context
+
+    if _DELEGATED_CHILD_CONTEXT.get() or is_advisory_turn_context():
         return False
     return not _NON_DISPATCHER_OWNED_CONTEXT.get()
 
@@ -126,9 +128,12 @@ def is_non_dispatcher_child_process_context() -> bool:
     """Return True for any execution that cannot own a Kanban worker run."""
     import os
 
+    from agent.bot_advisory import is_advisory_turn_context
+
     return bool(
         _DELEGATED_CHILD_CONTEXT.get()
         or _NON_DISPATCHER_OWNED_CONTEXT.get()
+        or is_advisory_turn_context()
         or os.environ.get(NON_DISPATCHER_CHILD_ENV_MARKER)
         or os.environ.get(DELEGATED_CHILD_ENV_MARKER)
     )

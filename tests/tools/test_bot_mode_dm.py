@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.bot_advisory import EXPLICIT_ADVISORY_MARKER
 from tools import bot_mode_dm, bot_mode_probe
 
 
@@ -234,10 +235,13 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert "final" not in command
     assert "$(" not in command
 
-    # attribution prefix applied server-side; body verbatim inside the file
+    # Local Bot-to-Bot delivery is explicitly advisory; legacy attribution is
+    # retained so older senders/receivers remain recognisable.
     dm_file = command.rsplit(" ", 1)[-1].strip("'")
     content = Path(dm_file).read_text(encoding="utf-8")
-    assert content.startswith("Message from 🤖 hermes (@hermes): ")
+    assert content.startswith(
+        f"{EXPLICIT_ADVISORY_MARKER}\nMessage from 🤖 hermes (@hermes): "
+    )
     assert '$(and this is not shell)' in content
 
 
@@ -275,7 +279,7 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     assert result["status"] == "sent"
     dm_file = calls[0]["command"].rsplit(" ", 1)[-1].strip("'")
     assert Path(dm_file).read_text(encoding="utf-8").startswith(
-        "Message from 🤖 coder (@coder): "
+        f"{EXPLICIT_ADVISORY_MARKER}\nMessage from 🤖 coder (@coder): "
     )
 
 

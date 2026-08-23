@@ -616,8 +616,13 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = scope_block
-        block_error_type = "tool_scope_block"
+        from agent.bot_advisory import advisory_tool_block
+
+        block_message = advisory_tool_block(agent, function_name)
+        block_error_type = "bot_advisory_block"
+        if block_message is None:
+            block_message = scope_block
+            block_error_type = "tool_scope_block"
         if block_message is None:
             block_error_type = "plugin_block"
 

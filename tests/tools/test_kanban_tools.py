@@ -982,6 +982,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub gateway",
         "assignee": "peer",
+        "idempotency_key": "auto-sub-gateway-1",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -1016,6 +1017,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub tui",
         "assignee": "peer",
+        "idempotency_key": "auto-sub-tui-1",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -1079,11 +1081,10 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
-    """If add_notify_sub itself raises (e.g. DB locked, schema drift),
-    _maybe_auto_subscribe must NOT bubble that up and fail the parent
-    kanban_create. The function returns False and the parent create
-    still succeeds with subscribed=False."""
+def test_attached_create_subscription_failure_stays_non_dispatchable(
+    monkeypatch, worker_env
+):
+    """A route failure commits only a typed, non-dispatchable task."""
     from tools import kanban_tools as kt
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
@@ -1098,10 +1099,57 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
+        "idempotency_key": "auto-sub-failure-1",
     })
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, d["task_id"])
+        assert task is not None
+        assert (task.status, task.block_kind) == ("blocked", "subscription_gate")
+        assert kb.list_runs(conn, task.id) == []
+
+
+def test_attached_create_requires_idempotency_key(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    out = json.loads(
+        kt._handle_create({"title": "missing key", "assignee": "peer"})
+    )
+    assert "idempotency_key" in out["error"]
+    with kb.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT id FROM tasks WHERE title = 'missing key'"
+        ).fetchone() is None
+
+
+def test_partial_attached_route_fails_closed(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    out = json.loads(
+        kt._handle_create(
+            {
+                "title": "partial route",
+                "assignee": "peer",
+                "idempotency_key": "partial-route-1",
+            }
+        )
+    )
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert (out["subscribed"], task.status, task.block_kind) == (
+            False,
+            "blocked",
+            "subscription_gate",
+        )
 
 
 # ---------------------------------------------------------------------------
