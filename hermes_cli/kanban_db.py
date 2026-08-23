@@ -533,6 +533,11 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+SUPERVISION_DEADLINE_SECONDS = 5 * 60
+SUPERVISION_LEASE_SECONDS = 60
+SUPERVISION_MAX_RUNTIME_SECONDS = 8 * 60 * 60
+SUPERVISION_MAX_GOAL_TURNS = 20
+SUPERVISION_MAX_RETRIES = 3
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -1341,6 +1346,19 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass
+class SupervisionWake:
+    task_id: str
+    creator_profile: str
+    creator_session_id: str
+    pending_event_id: int
+    event: Optional[Event]
+    deadline_generation: int
+    lease_token: str
+    lease_expires_at: int
+    attempt: int
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1530,6 +1548,13 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    supervision_session_id TEXT,
+    supervision_deadline_generation INTEGER NOT NULL DEFAULT 0,
+    supervision_deadline_at INTEGER,
+    supervision_pending_event_id INTEGER,
+    supervision_lease_token TEXT,
+    supervision_lease_expires_at INTEGER,
+    supervision_attempts INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2787,6 +2812,63 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        supervision_columns = (
+            ("supervision_session_id", "supervision_session_id TEXT"),
+            (
+                "supervision_deadline_generation",
+                "supervision_deadline_generation INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("supervision_deadline_at", "supervision_deadline_at INTEGER"),
+            ("supervision_pending_event_id", "supervision_pending_event_id INTEGER"),
+            ("supervision_lease_token", "supervision_lease_token TEXT"),
+            ("supervision_lease_expires_at", "supervision_lease_expires_at INTEGER"),
+            (
+                "supervision_attempts",
+                "supervision_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+        )
+        for column_name, column_sql in supervision_columns:
+            if column_name not in notify_cols:
+                _add_column_if_missing(
+                    conn, "kanban_notify_subs", column_name, column_sql
+                )
+        # One supervised mission has exactly one canonical creator route.
+        # Older builds could create duplicates on a route-key change; preserve
+        # those rows as passive notifications but strip their supervision
+        # authority before installing the fail-closed uniqueness constraint.
+        with write_txn(conn):
+            duplicate_routes = conn.execute(
+                "SELECT task_id, notifier_profile, supervision_session_id "
+                "FROM kanban_notify_subs WHERE supervision_session_id IS NOT NULL "
+                "GROUP BY task_id, notifier_profile, supervision_session_id "
+                "HAVING COUNT(*) > 1"
+            ).fetchall()
+            for duplicate in duplicate_routes:
+                rows = conn.execute(
+                    "SELECT rowid FROM kanban_notify_subs WHERE task_id = ? "
+                    "AND notifier_profile = ? AND supervision_session_id = ? "
+                    "ORDER BY created_at ASC, rowid ASC",
+                    (
+                        duplicate["task_id"],
+                        duplicate["notifier_profile"],
+                        duplicate["supervision_session_id"],
+                    ),
+                ).fetchall()
+                for extra in rows[1:]:
+                    conn.execute(
+                        "UPDATE kanban_notify_subs SET supervision_session_id = NULL, "
+                        "supervision_deadline_at = NULL, "
+                        "supervision_pending_event_id = NULL, "
+                        "supervision_lease_token = NULL, "
+                        "supervision_lease_expires_at = NULL, "
+                        "supervision_attempts = 0 WHERE rowid = ?",
+                        (extra["rowid"],),
+                    )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_supervision_owner "
+                "ON kanban_notify_subs(task_id, notifier_profile, "
+                "supervision_session_id) WHERE supervision_session_id IS NOT NULL"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2914,8 +2996,18 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " supervision_session_id TEXT,"
+        " supervision_deadline_generation INTEGER NOT NULL DEFAULT 0,"
+        " supervision_deadline_at INTEGER, supervision_pending_event_id INTEGER,"
+        " supervision_lease_token TEXT, supervision_lease_expires_at INTEGER,"
+        " supervision_attempts INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
-        ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
+        (
+            "CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",
+            "CREATE UNIQUE INDEX idx_notify_supervision_owner "
+            "ON kanban_notify_subs(task_id, notifier_profile, "
+            "supervision_session_id) WHERE supervision_session_id IS NOT NULL",
+        ),
     ),
 }
 
@@ -3613,6 +3705,175 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def create_supervised_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str],
+    acceptance: str,
+    creator_profile: str,
+    creator_session_id: str,
+    platform: str,
+    chat_id: str,
+    mission_key: str,
+    max_runtime_seconds: int,
+    goal_max_turns: int,
+    max_retries: int,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
+    chat_type: Optional[str] = None,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> str:
+    """Atomically create one self-owned mission and its supervision route.
+
+    Identity and routing values are trusted server context supplied by the
+    narrow owner tool handler, never model-call arguments.  The idempotency
+    key is namespaced by exact creator profile + durable session so two Bot
+    Chats cannot adopt each other's mission.  ``create_task`` deliberately
+    runs under this function's outer ``BEGIN IMMEDIATE`` savepoint: task and
+    route either become visible together or both roll back.
+    """
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    platform = str(platform or "").strip().lower()
+    chat_id = str(chat_id or "").strip()
+    mission_key = str(mission_key or "").strip()
+    acceptance = str(acceptance or "").strip()
+    if not profile:
+        raise ValueError("creator_profile is required")
+    if not session_id:
+        raise ValueError("creator_session_id is required")
+    if not platform or not chat_id:
+        raise ValueError("an attached supervision route is required")
+    if not mission_key or len(mission_key) > 200:
+        raise ValueError("mission_key must be 1-200 characters")
+    if not acceptance:
+        raise ValueError("acceptance is required")
+
+    runtime = int(max_runtime_seconds)
+    turns = int(goal_max_turns)
+    retries = int(max_retries)
+    if not 60 <= runtime <= SUPERVISION_MAX_RUNTIME_SECONDS:
+        raise ValueError(
+            f"max_runtime_seconds must be between 60 and "
+            f"{SUPERVISION_MAX_RUNTIME_SECONDS}"
+        )
+    if not 1 <= turns <= SUPERVISION_MAX_GOAL_TURNS:
+        raise ValueError(
+            f"goal_max_turns must be between 1 and {SUPERVISION_MAX_GOAL_TURNS}"
+        )
+    if not 1 <= retries <= SUPERVISION_MAX_RETRIES:
+        raise ValueError(
+            f"max_retries must be between 1 and {SUPERVISION_MAX_RETRIES}"
+        )
+
+    namespaced_key = f"owner:{profile}:{session_id}:{mission_key}"
+    opening = str(body or "").strip()
+    task_body = (
+        f"{opening}\n\nAcceptance:\n{acceptance}" if opening
+        else f"Acceptance:\n{acceptance}"
+    )
+    created_at = int(time.time()) if now is None else int(now)
+    deadline_at = created_at + SUPERVISION_DEADLINE_SECONDS
+    metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
+    thread = str(thread_id or "")
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT id, created_by, assignee, session_id FROM tasks "
+            "WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (namespaced_key,),
+        ).fetchone()
+        task_id = (
+            existing["id"]
+            if existing is not None
+            else create_task(
+                conn,
+                title=title,
+                body=task_body,
+                assignee=profile,
+                created_by=profile,
+                workspace_kind="scratch",
+                idempotency_key=namespaced_key,
+                max_runtime_seconds=runtime,
+                max_retries=retries,
+                goal_mode=True,
+                goal_max_turns=turns,
+                session_id=session_id,
+                board=board,
+            )
+        )
+        task_row = conn.execute(
+            "SELECT created_by, assignee, session_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None or (
+            task_row["created_by"] != profile
+            or task_row["assignee"] != profile
+            or task_row["session_id"] != session_id
+        ):
+            raise RuntimeError(
+                "supervised mission key is already owned by another identity"
+            )
+
+        route = conn.execute(
+            "SELECT platform, chat_id, thread_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND notifier_profile = ? "
+            "AND supervision_session_id = ? LIMIT 1",
+            (task_id, profile, session_id),
+        ).fetchone()
+        if route is not None:
+            if (
+                route["platform"] != platform
+                or route["chat_id"] != chat_id
+                or route["thread_id"] != thread
+            ):
+                raise RuntimeError(
+                    "supervision mission is already bound to a different route"
+                )
+        else:
+            cursor_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS cursor FROM task_events "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            cursor = int(cursor_row["cursor"] if cursor_row else 0)
+            conn.execute(
+                """
+                INSERT INTO kanban_notify_subs (
+                    task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+                    chat_type, notifier_profile, delivery_mode,
+                    delivery_metadata, created_at, last_event_id,
+                    supervision_session_id, supervision_deadline_generation,
+                    supervision_deadline_at, supervision_pending_event_id,
+                    supervision_lease_token, supervision_lease_expires_at,
+                    supervision_attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'wake', ?, ?, ?, ?, 1, ?,
+                          NULL, NULL, NULL, 0)
+                """,
+                (
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread,
+                    user_id,
+                    user_id_alt,
+                    chat_type or "dm",
+                    profile,
+                    metadata_json,
+                    created_at,
+                    cursor,
+                    session_id,
+                    deadline_at,
+                ),
+            )
+        return task_id
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -4995,6 +5256,48 @@ def heartbeat_claim(
         return False
 
 
+def _append_supervision_recovery_once(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    recovery_kind: str,
+    run_id: Optional[int] = None,
+    details: Optional[dict] = None,
+) -> bool:
+    """Append the one mission-wide recovery marker for supervised tasks.
+
+    Callers already hold the transaction that performs the recovery.  The
+    marker is intentionally placed immediately before the existing concrete
+    recovery event, so retries and alternate dispatcher recovery paths share
+    one durable task-event audit boundary without another controller/store.
+    """
+    supervised = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+        "AND supervision_session_id IS NOT NULL LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if supervised is None:
+        return False
+    already_recorded = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? "
+        "AND kind = 'supervision_recovery' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if already_recorded is not None:
+        return False
+    payload = {"recovery_kind": str(recovery_kind)}
+    if details:
+        payload["details"] = details
+    _append_event(
+        conn,
+        task_id,
+        "supervision_recovery",
+        payload,
+        run_id=run_id,
+    )
+    return True
+
+
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -5112,6 +5415,13 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
+            _append_supervision_recovery_once(
+                conn,
+                row["id"],
+                recovery_kind="reclaimed",
+                run_id=_current_run_id(conn, row["id"]),
+                details={"stale_lock": row["claim_lock"]},
+            )
             run_id = _end_run(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
@@ -6350,6 +6660,7 @@ def block_task(
     kind: Optional[str] = None,
     input_request: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    _allow_nested: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6392,7 +6703,7 @@ def block_task(
         except (TypeError, ValueError):
             raise ValueError("input_request must contain finite JSON values") from None
     recurrences = 0
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=_allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -8868,6 +9179,13 @@ def enforce_max_runtime(
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                _append_supervision_recovery_once(
+                    conn,
+                    tid,
+                    recovery_kind="timed_out",
+                    run_id=_current_run_id(conn, tid),
+                    details={"pid": pid, "elapsed_seconds": int(elapsed)},
+                )
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
@@ -9001,6 +9319,13 @@ def detect_stale_running(
             if cur.rowcount != 1:
                 continue
 
+            _append_supervision_recovery_once(
+                conn,
+                tid,
+                recovery_kind="stale",
+                run_id=_current_run_id(conn, tid),
+                details={"pid": int(pid) if pid else None},
+            )
             payload = {
                 "elapsed_seconds": int(elapsed),
                 "last_heartbeat_at": (
@@ -9096,6 +9421,13 @@ def reconcile_orphaned_running(
             )
             if cur.rowcount != 1:
                 continue
+            _append_supervision_recovery_once(
+                conn,
+                tid,
+                recovery_kind="reconciled",
+                run_id=_current_run_id(conn, tid),
+                details={"reason": "orphaned_running"},
+            )
             payload = {
                 "reason": "orphaned_running",
                 "claim_lock": row["claim_lock"],
@@ -9345,6 +9677,13 @@ def _apply_iteration_exhaustion(
     )
     if cur.rowcount != 1:
         return False, payload
+    _append_supervision_recovery_once(
+        conn,
+        task_id,
+        recovery_kind="iteration_exhausted",
+        run_id=run_id,
+        details={"disposition": payload.get("disposition")},
+    )
     ended = _end_run(
         conn,
         task_id,
@@ -9523,6 +9862,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                _append_supervision_recovery_once(
+                    conn,
+                    row["id"],
+                    recovery_kind=event_kind,
+                    run_id=(
+                        int(row["current_run_id"])
+                        if row["current_run_id"] is not None else None
+                    ),
+                    details={"pid": pid},
+                )
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
@@ -12492,6 +12841,674 @@ def purge_stale_done_notify_subs(
             (cutoff,),
         )
     return int(cur.rowcount or 0)
+
+
+_SUPERVISION_NON_ACTIONABLE_KINDS = frozenset({
+    "supervision_receipt",
+    "supervision_recovery",
+    "supervision_rearmed",
+    "heartbeat",
+    "claim_extended",
+    "claimed",
+    "spawned",
+    "commented",
+})
+
+
+def supervision_worker_is_healthy(
+    conn: sqlite3.Connection,
+    task_id: str,
+    creator_profile: str,
+    *,
+    now: Optional[int] = None,
+    pid_alive_fn=None,
+) -> bool:
+    """Return true only for the exact current, in-bounds same-profile run."""
+    profile = _canonical_assignee(creator_profile)
+    if not profile:
+        return False
+    checked_at = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT t.status AS task_status, t.assignee, t.current_run_id, "
+        "t.claim_lock AS task_claim_lock, t.claim_expires AS task_claim_expires, "
+        "t.worker_pid AS task_worker_pid, t.max_runtime_seconds AS task_max_runtime, "
+        "t.last_heartbeat_at AS task_heartbeat, t.started_at AS task_started, "
+        "r.id AS run_id, r.profile AS run_profile, r.status AS run_status, "
+        "r.claim_lock AS run_claim_lock, r.claim_expires AS run_claim_expires, "
+        "r.worker_pid AS run_worker_pid, r.max_runtime_seconds AS run_max_runtime, "
+        "r.last_heartbeat_at AS run_heartbeat, r.started_at AS run_started "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if not (
+        row["task_status"] == "running"
+        and row["assignee"] == profile
+        and row["current_run_id"] is not None
+        and row["run_id"] == row["current_run_id"]
+        and row["run_profile"] == profile
+        and row["run_status"] == "running"
+        and row["task_claim_lock"]
+        and row["task_claim_lock"] == row["run_claim_lock"]
+        and row["task_worker_pid"]
+        and row["task_worker_pid"] == row["run_worker_pid"]
+        and row["task_claim_expires"] is not None
+        and row["run_claim_expires"] is not None
+        and int(row["task_claim_expires"]) > checked_at
+        and int(row["run_claim_expires"]) > checked_at
+    ):
+        return False
+    pid = int(row["task_worker_pid"])
+    alive = pid_alive_fn or _pid_alive
+    try:
+        if not alive(pid):
+            return False
+    except Exception:
+        return False
+    started_at = row["run_started"] or row["task_started"]
+    runtime_limit = row["run_max_runtime"] or row["task_max_runtime"]
+    if started_at is None:
+        return False
+    if runtime_limit is not None and checked_at - int(started_at) >= int(runtime_limit):
+        return False
+    heartbeat_at = row["run_heartbeat"] or row["task_heartbeat"] or started_at
+    return (
+        checked_at - int(heartbeat_at)
+        <= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    )
+
+
+def _suppress_healthy_supervision_deadline(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    now: int,
+    pid_alive_fn=None,
+) -> bool:
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    if not profile or not session_id:
+        return False
+    with write_txn(conn):
+        route = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? LIMIT 1",
+            (task_id, profile, session_id),
+        ).fetchone()
+        if (
+            route is None
+            or route["supervision_deadline_at"] is None
+            or int(route["supervision_deadline_at"]) > int(now)
+            or route["supervision_pending_event_id"] is not None
+            or (
+                route["supervision_lease_token"]
+                and route["supervision_lease_expires_at"] is not None
+                and int(route["supervision_lease_expires_at"]) > int(now)
+            )
+        ):
+            return False
+        placeholders = ",".join("?" for _ in _SUPERVISION_NON_ACTIONABLE_KINDS)
+        event = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? "
+            f"AND kind NOT IN ({placeholders}) LIMIT 1",
+            (
+                task_id,
+                int(route["last_event_id"]),
+                *sorted(_SUPERVISION_NON_ACTIONABLE_KINDS),
+            ),
+        ).fetchone()
+        if event is not None or not supervision_worker_is_healthy(
+            conn,
+            task_id,
+            profile,
+            now=int(now),
+            pid_alive_fn=pid_alive_fn,
+        ):
+            return False
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET "
+            "supervision_deadline_generation = supervision_deadline_generation + 1, "
+            "supervision_deadline_at = ? WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notifier_profile = ? "
+            "AND supervision_session_id = ? AND supervision_deadline_at <= ? "
+            "AND supervision_pending_event_id IS NULL",
+            (
+                int(now) + SUPERVISION_DEADLINE_SECONDS,
+                task_id,
+                route["platform"],
+                route["chat_id"],
+                route["thread_id"],
+                profile,
+                session_id,
+                int(now),
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def poll_supervision_wake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    now: Optional[int] = None,
+    lease_seconds: int = SUPERVISION_LEASE_SECONDS,
+    pid_alive_fn=None,
+) -> Optional[SupervisionWake]:
+    """Poll one supervision route, suppressing only healthy due deadlines."""
+    checked_at = int(time.time()) if now is None else int(now)
+    if _suppress_healthy_supervision_deadline(
+        conn,
+        task_id=task_id,
+        creator_profile=creator_profile,
+        creator_session_id=creator_session_id,
+        now=checked_at,
+        pid_alive_fn=pid_alive_fn,
+    ):
+        return None
+    return lease_supervision_wake(
+        conn,
+        task_id=task_id,
+        creator_profile=creator_profile,
+        creator_session_id=creator_session_id,
+        now=checked_at,
+        lease_seconds=lease_seconds,
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> Event:
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except Exception:
+        payload = None
+    return Event(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        kind=row["kind"],
+        payload=payload,
+        created_at=int(row["created_at"]),
+        run_id=(
+            int(row["run_id"])
+            if "run_id" in row.keys() and row["run_id"] is not None
+            else None
+        ),
+    )
+
+
+def lease_supervision_wake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    now: Optional[int] = None,
+    lease_seconds: int = SUPERVISION_LEASE_SECONDS,
+) -> Optional[SupervisionWake]:
+    """Lease one event-backed or deadline-backed owner supervision turn.
+
+    The ACK cursor is deliberately untouched.  A crashed watcher leaves the
+    pending id in place; another watcher can replace the token only after the
+    lease expires and receives the same pending unit with an incremented
+    attempt number.
+    """
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    if not profile or not session_id:
+        return None
+    claimed_at = int(time.time()) if now is None else int(now)
+    lease_for = max(1, int(lease_seconds))
+    lease_expires = claimed_at + lease_for
+    token = secrets.token_urlsafe(24)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? LIMIT 1",
+            (task_id, profile, session_id),
+        ).fetchone()
+        if row is None or row["supervision_deadline_at"] is None:
+            return None
+        current_token = row["supervision_lease_token"]
+        current_expiry = row["supervision_lease_expires_at"]
+        if current_token and current_expiry is not None and int(current_expiry) > claimed_at:
+            return None
+
+        prior_pending = row["supervision_pending_event_id"]
+        pending_id = int(prior_pending) if prior_pending is not None else None
+        event_row = None
+        if pending_id is not None and pending_id > 0:
+            event_row = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND id = ?",
+                (task_id, pending_id),
+            ).fetchone()
+            if event_row is None:
+                # A deleted pending event cannot be ACKed safely.  Leave the
+                # cursor untouched and fall through to the next durable event.
+                pending_id = None
+        if pending_id is None:
+            placeholders = ",".join("?" for _ in _SUPERVISION_NON_ACTIONABLE_KINDS)
+            event_row = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+                f"AND kind NOT IN ({placeholders}) ORDER BY id ASC LIMIT 1",
+                (
+                    task_id,
+                    int(row["last_event_id"]),
+                    *sorted(_SUPERVISION_NON_ACTIONABLE_KINDS),
+                ),
+            ).fetchone()
+            if event_row is not None:
+                pending_id = int(event_row["id"])
+            else:
+                deadline_at = row["supervision_deadline_at"]
+                if deadline_at is None or int(deadline_at) > claimed_at:
+                    return None
+                pending_id = 0
+        elif pending_id == 0:
+            event_row = None
+
+        attempt = (
+            int(row["supervision_attempts"] or 0) + 1
+            if prior_pending is not None and int(prior_pending) == pending_id
+            else 1
+        )
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET supervision_pending_event_id = ?, "
+            "supervision_lease_token = ?, supervision_lease_expires_at = ?, "
+            "supervision_attempts = ? WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notifier_profile = ? "
+            "AND supervision_session_id = ? AND "
+            "(supervision_lease_token IS NULL OR supervision_lease_expires_at <= ?)",
+            (
+                pending_id,
+                token,
+                lease_expires,
+                attempt,
+                task_id,
+                row["platform"],
+                row["chat_id"],
+                row["thread_id"],
+                profile,
+                session_id,
+                claimed_at,
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        return SupervisionWake(
+            task_id=task_id,
+            creator_profile=profile,
+            creator_session_id=session_id,
+            pending_event_id=pending_id,
+            event=_event_from_row(event_row) if event_row is not None else None,
+            deadline_generation=int(row["supervision_deadline_generation"] or 0),
+            lease_token=token,
+            lease_expires_at=lease_expires,
+            attempt=attempt,
+        )
+
+
+def finalize_supervision_wake(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    lease_token: str,
+    disposition: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Write one receipt and ACK/rearm through an exact lease-token CAS."""
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    token = str(lease_token or "").strip()
+    if not profile or not session_id or not token:
+        return False
+    finalized_at = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        route = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? "
+            "AND supervision_lease_token = ? LIMIT 1",
+            (task_id, profile, session_id, token),
+        ).fetchone()
+        if route is None or route["supervision_pending_event_id"] is None:
+            return False
+        task = conn.execute(
+            "SELECT status, block_kind, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            return False
+        pending_id = int(route["supervision_pending_event_id"])
+        pending_event = (
+            conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id = ? AND id = ?",
+                (task_id, pending_id),
+            ).fetchone()
+            if pending_id > 0 else None
+        )
+        pending_run_id = (
+            int(pending_event["run_id"])
+            if pending_event is not None and pending_event["run_id"] is not None
+            else None
+        )
+        terminal = (
+            task["status"] in {"done", "archived"}
+            or (task["status"] == "blocked" and bool(task["block_kind"]))
+        )
+        next_generation = int(route["supervision_deadline_generation"] or 0)
+        next_deadline = None
+        if not terminal:
+            next_generation += 1
+            next_deadline = finalized_at + SUPERVISION_DEADLINE_SECONDS
+
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET "
+            "last_event_id = CASE WHEN ? > last_event_id THEN ? ELSE last_event_id END, "
+            "supervision_deadline_generation = ?, supervision_deadline_at = ?, "
+            "supervision_pending_event_id = NULL, supervision_lease_token = NULL, "
+            "supervision_lease_expires_at = NULL, supervision_attempts = 0 "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? "
+            "AND supervision_lease_token = ?",
+            (
+                pending_id,
+                pending_id,
+                next_generation,
+                next_deadline,
+                task_id,
+                route["platform"],
+                route["chat_id"],
+                route["thread_id"],
+                profile,
+                session_id,
+                token,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "supervision_receipt",
+            {
+                "creator_profile": profile,
+                "creator_session_id": session_id,
+                "current_run_id": task["current_run_id"],
+                "pending_run_id": pending_run_id,
+                "event_sequence": pending_id,
+                "deadline_generation": int(
+                    route["supervision_deadline_generation"] or 0
+                ),
+                "status": task["status"],
+                "disposition": str(disposition or "completed")[:200],
+                "terminal": terminal,
+            },
+            run_id=(
+                int(task["current_run_id"])
+                if task["current_run_id"] is not None else pending_run_id
+            ),
+        )
+        return True
+
+
+def record_supervision_terminal_block(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    reason: str,
+    kind: str,
+    now: Optional[int] = None,
+    _allow_nested: bool = False,
+) -> bool:
+    """Stop one exact creator route after a typed terminal self-block.
+
+    The route cursor is moved through the terminal receipt in the same
+    transaction.  Later broad ``unblock_task`` calls remain compatible but do
+    not silently restore creator authority; only :func:`rearm_supervision`
+    does that.
+    """
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    block_kind = str(kind or "").strip()
+    if (
+        not profile
+        or not session_id
+        or block_kind not in {"needs_input", "capability", "transient"}
+    ):
+        return False
+    finalized_at = int(time.time()) if now is None else int(now)
+    with write_txn(conn, allow_nested=_allow_nested):
+        task = conn.execute(
+            "SELECT status, block_kind, created_by, assignee, session_id, "
+            "current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        route = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? LIMIT 1",
+            (task_id, profile, session_id),
+        ).fetchone()
+        if (
+            task is None
+            or route is None
+            or task["status"] not in {"blocked", "triage"}
+            or task["block_kind"] != block_kind
+            or task["created_by"] != profile
+            or task["assignee"] != profile
+            or task["session_id"] != session_id
+            or route["supervision_deadline_at"] is None
+        ):
+            return False
+        pending_id = int(route["supervision_pending_event_id"] or 0)
+        payload = {
+            "creator_profile": profile,
+            "creator_session_id": session_id,
+            "current_run_id": task["current_run_id"],
+            "event_sequence": pending_id,
+            "deadline_generation": int(
+                route["supervision_deadline_generation"] or 0
+            ),
+            "status": task["status"],
+            "disposition": "self_blocked",
+            "terminal": True,
+            "block_kind": block_kind,
+            "reason": str(reason or "")[:1000],
+            "finalized_at": finalized_at,
+        }
+        _append_event(
+            conn,
+            task_id,
+            "supervision_receipt",
+            payload,
+            run_id=(
+                int(task["current_run_id"])
+                if task["current_run_id"] is not None else None
+            ),
+        )
+        receipt_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "supervision_deadline_at = NULL, "
+            "supervision_pending_event_id = NULL, "
+            "supervision_lease_token = NULL, "
+            "supervision_lease_expires_at = NULL, supervision_attempts = 0 "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? "
+            "AND supervision_deadline_at IS NOT NULL",
+            (
+                receipt_id,
+                task_id,
+                route["platform"],
+                route["chat_id"],
+                route["thread_id"],
+                profile,
+                session_id,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+class _SelfOwnedSupervisionBlockAbort(RuntimeError):
+    """Internal rollback signal for an all-or-nothing owner self-block."""
+
+
+def block_self_owned_supervision(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    reason: str,
+    kind: str,
+    now: Optional[int] = None,
+    pid_alive_fn=None,
+) -> tuple[bool, str]:
+    """Atomically guard, block, receipt, and stop one exact owner route."""
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    block_kind = str(kind or "").strip()
+    if (
+        not profile
+        or not session_id
+        or block_kind not in {"needs_input", "capability", "transient"}
+    ):
+        return False, "invalid owner identity or typed block kind"
+    checked_at = int(time.time()) if now is None else int(now)
+    try:
+        with write_txn(conn):
+            task = conn.execute(
+                "SELECT created_by, assignee, session_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            route = conn.execute(
+                "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? "
+                "AND notifier_profile = ? AND supervision_session_id = ? "
+                "AND supervision_deadline_at IS NOT NULL LIMIT 1",
+                (task_id, profile, session_id),
+            ).fetchone()
+            if task is None or route is None or (
+                task["created_by"] != profile
+                or task["assignee"] != profile
+                or task["session_id"] != session_id
+            ):
+                return False, "task is not owned by this exact creator session"
+            if supervision_worker_is_healthy(
+                conn,
+                task_id,
+                profile,
+                now=checked_at,
+                pid_alive_fn=pid_alive_fn,
+            ):
+                return (
+                    False,
+                    "cannot self-block while the exact same-profile worker is healthy",
+                )
+            if not block_task(
+                conn,
+                task_id,
+                reason=reason,
+                kind=block_kind,
+                _allow_nested=True,
+            ):
+                return False, "task is not blockable from its current state"
+            try:
+                recorded = record_supervision_terminal_block(
+                    conn,
+                    task_id=task_id,
+                    creator_profile=profile,
+                    creator_session_id=session_id,
+                    reason=reason,
+                    kind=block_kind,
+                    now=checked_at,
+                    _allow_nested=True,
+                )
+            except Exception as exc:
+                raise _SelfOwnedSupervisionBlockAbort(
+                    "terminal supervision receipt failed; self-block rolled back"
+                ) from exc
+            if not recorded:
+                raise _SelfOwnedSupervisionBlockAbort(
+                    "terminal supervision receipt failed; self-block rolled back"
+                )
+        return True, ""
+    except _SelfOwnedSupervisionBlockAbort as exc:
+        return False, str(exc)
+
+
+def rearm_supervision(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    creator_profile: str,
+    creator_session_id: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Explicitly rearm a stopped creator route after a privileged unblock."""
+    profile = _canonical_assignee(creator_profile)
+    session_id = str(creator_session_id or "").strip()
+    if not profile or not session_id:
+        return False
+    rearmed_at = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, created_by, assignee, session_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        route = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+            "AND notifier_profile = ? AND supervision_session_id = ? LIMIT 1",
+            (task_id, profile, session_id),
+        ).fetchone()
+        if (
+            task is None
+            or route is None
+            or task["status"] not in {"todo", "ready", "running", "review"}
+            or task["created_by"] != profile
+            or task["assignee"] != profile
+            or task["session_id"] != session_id
+            or route["supervision_deadline_at"] is not None
+        ):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "supervision_rearmed",
+            {
+                "creator_profile": profile,
+                "creator_session_id": session_id,
+                "deadline_generation": int(
+                    route["supervision_deadline_generation"] or 0
+                ) + 1,
+            },
+        )
+        marker_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ?, "
+            "supervision_deadline_generation = supervision_deadline_generation + 1, "
+            "supervision_deadline_at = ?, supervision_pending_event_id = NULL, "
+            "supervision_lease_token = NULL, supervision_lease_expires_at = NULL, "
+            "supervision_attempts = 0 WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND notifier_profile = ? "
+            "AND supervision_session_id = ? AND supervision_deadline_at IS NULL",
+            (
+                marker_id,
+                rearmed_at + SUPERVISION_DEADLINE_SECONDS,
+                task_id,
+                route["platform"],
+                route["chat_id"],
+                route["thread_id"],
+                profile,
+                session_id,
+            ),
+        )
+        return cur.rowcount == 1
 
 
 def unseen_events_for_sub(

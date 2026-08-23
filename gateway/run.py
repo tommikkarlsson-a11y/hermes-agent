@@ -2721,6 +2721,23 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _kanban_supervision_identity_matches(
+    supervision: Any,
+    *,
+    session_id: str,
+    profile: str,
+) -> bool:
+    """Fail closed unless a supervision turn targets the exact durable owner."""
+    if not isinstance(supervision, dict):
+        return False
+    return (
+        str(session_id or "").strip()
+        == str(supervision.get("creator_session_id") or "").strip()
+        and str(profile or "").strip()
+        == str(supervision.get("creator_profile") or "").strip()
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -20365,6 +20382,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _supervision = (
+                event.metadata.get("kanban_supervision")
+                if isinstance(getattr(event, "metadata", None), dict)
+                else None
+            )
+            if isinstance(_supervision, dict):
+                _source_profile = str(
+                    getattr(source, "profile", None) or ""
+                ).strip()
+                if not _kanban_supervision_identity_matches(
+                    _supervision,
+                    session_id=_run_start_session_id,
+                    profile=_source_profile,
+                ):
+                    logger.warning(
+                        "kanban supervision pre-turn identity mismatch; "
+                        "leaving lease unfinalized"
+                    )
+                    return None
+                # Compression may rotate session_entry.session_id before the
+                # post-turn hook. Preserve the exact durable session that
+                # actually admitted this supervision turn.
+                event._kanban_supervision_turn_session_id = _run_start_session_id
             _turn_started_monotonic = time.monotonic()
             agent_result = await self._run_agent(
                 message=message_text,
@@ -21815,6 +21855,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as exc:
             logger.debug("loop completion hook failed: %s", exc)
+
+        supervision = (
+            getattr(event, "metadata", {}).get("kanban_supervision")
+            if event is not None and isinstance(getattr(event, "metadata", None), dict)
+            else None
+        )
+        if isinstance(supervision, dict):
+            creator_session_id = str(
+                supervision.get("creator_session_id") or ""
+            ).strip()
+            creator_profile = str(
+                supervision.get("creator_profile") or ""
+            ).strip()
+            source_profile = str(getattr(source, "profile", None) or "").strip()
+            supervision_turn_session_id = str(
+                getattr(
+                    event,
+                    "_kanban_supervision_turn_session_id",
+                    session_entry.session_id,
+                )
+                or ""
+            )
+            if not _kanban_supervision_identity_matches(
+                supervision,
+                session_id=supervision_turn_session_id,
+                profile=source_profile,
+            ):
+                logger.warning(
+                    "kanban supervision turn resolved to session/profile %s/%s, "
+                    "expected %s/%s; leaving lease unfinalized",
+                    supervision_turn_session_id,
+                    source_profile,
+                    creator_session_id,
+                    creator_profile,
+                )
+            else:
+                completed = isinstance(agent_result, dict) and not (
+                    agent_result.get("interrupted") or agent_result.get("error")
+                )
+                if completed:
+                    await self._finalize_kanban_supervision_turn(
+                        supervision,
+                        disposition="complete",
+                    )
+                else:
+                    logger.warning(
+                        "kanban supervision turn did not complete; "
+                        "leaving lease unfinalized"
+                    )
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
