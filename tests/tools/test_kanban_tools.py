@@ -708,6 +708,20 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_verified_recovery_attempt_contract():
+    """Kanban workers must carry a concise verified-recovery contract:
+    deterministic reproduction, smallest reversible repair, risk-based
+    verification, at most one attempt, then complete or block/rollback."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "8. **Verified recovery attempt.**" in KANBAN_GUIDANCE
+    assert "deterministically reproduce it" in KANBAN_GUIDANCE
+    assert "smallest in-scope reversible repair" in KANBAN_GUIDANCE
+    assert "risk-based tests or read-back" in KANBAN_GUIDANCE
+    assert "Make at most one bounded repair attempt" in KANBAN_GUIDANCE
+    assert "roll back unverified changes and block" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
