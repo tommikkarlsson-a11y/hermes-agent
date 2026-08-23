@@ -11,6 +11,7 @@ path — including the in-flight cron drain floor from #86684.
 
 import json
 import os
+import subprocess
 import time
 
 import pytest
@@ -193,6 +194,11 @@ class TestLaunchdRestartWedgedIntegration:
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 180.0)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_print_service_pid",
+            lambda domain, label: (True, 4242),
+        )
         monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
         monkeypatch.setattr(
             gateway_cli, "_request_gateway_self_restart", lambda pid: False
@@ -226,6 +232,14 @@ class TestLaunchdRestartWedgedIntegration:
         monkeypatch.setattr(
             gateway_cli, "_clear_launchd_unsupported_marker", lambda: None
         )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout, domain: events.append(
+                ("service-pid", label, old_pid, domain)
+            )
+            or True,
+        )
         return events
 
     def test_wedged_gateway_skips_drain_and_escalates(self, monkeypatch):
@@ -249,3 +263,72 @@ class TestLaunchdRestartWedgedIntegration:
         gateway_cli.launchd_restart()
         assert "escalate" not in events
         assert ("drain", 180.0) in events
+
+    def test_kickstart_without_fresh_service_pid_is_failure(
+        self, monkeypatch, capsys
+    ):
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout, domain: events.append(
+                ("service-pid", label, old_pid, domain)
+            )
+            or False,
+        )
+
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            gateway_cli.launchd_restart()
+
+        assert "did not acquire a fresh PID" in (exc_info.value.stderr or "")
+        assert "✓ Service restarted" not in capsys.readouterr().out
+        assert ("service-pid", "ai.hermes.gateway", 4242, "gui/501") in events
+
+    def test_kickstart_with_fresh_service_pid_reports_success(
+        self, monkeypatch, capsys
+    ):
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+
+        gateway_cli.launchd_restart()
+
+        assert "✓ Service restarted" in capsys.readouterr().out
+        assert ("service-pid", "ai.hermes.gateway", 4242, "gui/501") in events
+
+    def test_bootstrap_without_fresh_service_pid_is_failure(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_print_service_pid",
+            lambda domain, label: (False, None),
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_launchd_plist_path", lambda: tmp_path / "gateway.plist"
+        )
+
+        first_kickstart = True
+
+        def fake_run(command, **kwargs):
+            nonlocal first_kickstart
+            events.append(tuple(command))
+            if command[:3] == ["launchctl", "kickstart", "-k"] and first_kickstart:
+                first_kickstart = False
+                raise subprocess.CalledProcessError(113, command)
+            return __import__("types").SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda label, old_pid, timeout, domain: False,
+        )
+
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            gateway_cli.launchd_restart()
+
+        assert "did not acquire a fresh PID" in (exc_info.value.stderr or "")
+        assert "✓ Service restarted" not in capsys.readouterr().out
+        assert any(command[:2] == ("launchctl", "bootstrap") for command in events)

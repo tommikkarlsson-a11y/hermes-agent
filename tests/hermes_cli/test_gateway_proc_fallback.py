@@ -177,6 +177,38 @@ class TestPsFallbackBsdCompat:
         )
 
 
+class TestRestartManagerDiscovery:
+    """Lifecycle CLIs are opt-in cleanup targets, never health evidence."""
+
+    def test_find_gateway_pids_excludes_restart_manager_by_default(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(gateway_mod, "_get_service_pids", lambda **_k: set())
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_mod,
+            "_scan_gateway_pids",
+            lambda *_a, **kwargs: seen.append(kwargs["include_restart_managers"])
+            or ([59864] if kwargs["include_restart_managers"] else []),
+        )
+
+        assert gateway_mod.find_gateway_pids() == []
+        assert seen == [False]
+
+    def test_find_gateway_pids_can_explicitly_include_restart_manager(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(gateway_mod, "_get_service_pids", lambda **_k: set())
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_mod,
+            "_scan_gateway_pids",
+            lambda *_a, **kwargs: seen.append(kwargs["include_restart_managers"])
+            or ([59864] if kwargs["include_restart_managers"] else []),
+        )
+
+        assert gateway_mod.find_gateway_pids(include_restart_managers=True) == [59864]
+        assert seen == [True]
+
+
 class TestGetServicePidsAllProfiles:
     """_get_service_pids(all_profiles=...) discovery across profiles."""
 

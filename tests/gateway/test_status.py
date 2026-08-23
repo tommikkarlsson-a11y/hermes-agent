@@ -171,6 +171,44 @@ class TestGatewayPidState:
 
 
 class TestGatewayRuntimeStatus:
+    @pytest.mark.parametrize("live_cmdline", [
+        "hermes --profile ops gateway restart",
+        "python -m hermes_cli.main --profile ops gateway restart",
+    ])
+    def test_runtime_status_rejects_lifecycle_cli_pid(
+        self, monkeypatch, live_cmdline
+    ):
+        payload = {
+            "pid": 59864,
+            "kind": "hermes-gateway",
+            "argv": live_cmdline.split(),
+            "start_time": 123,
+            "gateway_state": "running",
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: live_cmdline)
+
+        assert status.get_runtime_status_running_pid(payload) is None
+
+    def test_runtime_status_keeps_real_gateway_run(self, monkeypatch):
+        live_cmdline = (
+            "python -m hermes_cli.main --profile ops gateway run "
+            "--external-supervisor"
+        )
+        payload = {
+            "pid": 60041,
+            "kind": "hermes-gateway",
+            "argv": live_cmdline.split(),
+            "start_time": 456,
+            "gateway_state": "running",
+        }
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 456)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: live_cmdline)
+
+        assert status.get_runtime_status_running_pid(payload) == 60041
+
     def test_clear_profile_platforms_preserves_primary_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "gateway_state.json").write_text(

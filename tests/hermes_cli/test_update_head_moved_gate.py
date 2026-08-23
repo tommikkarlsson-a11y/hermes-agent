@@ -111,7 +111,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     import hermes_cli.gateway as hermes_gateway
 
     monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+        hermes_gateway, "find_gateway_pids", lambda all_profiles=False, **_kwargs: []
     )
     monkeypatch.setattr(
         hermes_gateway, "supports_systemd_services", lambda: False

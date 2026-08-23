@@ -745,7 +745,10 @@ def _filter_venv_launcher_stubs(pids: list[int]) -> list[int]:
 
 
 def find_gateway_pids(
-    exclude_pids: set | None = None, all_profiles: bool = False
+    exclude_pids: set | None = None,
+    all_profiles: bool = False,
+    *,
+    include_restart_managers: bool = False,
 ) -> list:
     """Find PIDs of running gateway processes.
 
@@ -757,6 +760,9 @@ def find_gateway_pids(
             needs this because a code update affects every profile.
             When ``False`` (default), only PIDs belonging to the current
             Hermes profile are returned.
+        include_restart_managers: Include a no-supervisor ``gateway restart``
+            process that may host the runtime. This is an explicit cleanup and
+            update opt-in; health/status callers must keep the strict default.
     """
     _exclude = set(exclude_pids or set())
     pids: list[int] = []
@@ -769,10 +775,6 @@ def find_gateway_pids(
             pass
     for pid in _get_service_pids(all_profiles=all_profiles):
         _append_unique_pid(pids, pid, _exclude)
-    try:
-        include_restart_managers = not supports_systemd_services()
-    except Exception:
-        include_restart_managers = False
     for pid in _scan_gateway_pids(
         _exclude,
         all_profiles=all_profiles,
@@ -1932,7 +1934,9 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         # the pidfile-less gap neither exclusion above can see (#83683, #86098).
         orphans = [
             p
-            for p in find_gateway_pids(exclude_pids=own)
+            for p in find_gateway_pids(
+                exclude_pids=own, include_restart_managers=True
+            )
             if p and p > 0 and not _reaper_candidate_is_supervisor_owned(p)
         ]
     except Exception:
@@ -5363,11 +5367,14 @@ def _wait_for_launchd_service_pid(
 
 def launchd_restart():
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
+    old_service_pid = None
     try:
+        _loaded, old_service_pid = _launchd_print_service_pid(domain, label)
         pid = get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
@@ -5409,6 +5416,14 @@ def launchd_restart():
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        if not _wait_for_launchd_service_pid(
+            label, old_pid=old_service_pid, timeout=15.0, domain=domain
+        ):
+            raise subprocess.CalledProcessError(
+                1,
+                ["launchctl", "kickstart", "-k", target],
+                stderr=f"{target} did not acquire a fresh PID after restart",
+            )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
@@ -5435,7 +5450,7 @@ def launchd_restart():
                 timeout=90,
             )
             subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                ["launchctl", "bootstrap", domain, str(plist_path)],
                 check=True,
                 timeout=30,
             )
@@ -5445,6 +5460,14 @@ def launchd_restart():
                 raise
             _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
             return
+        if not _wait_for_launchd_service_pid(
+            label, old_pid=old_service_pid, timeout=15.0, domain=domain
+        ):
+            raise subprocess.CalledProcessError(
+                1,
+                ["launchctl", "kickstart", target],
+                stderr=f"{target} did not acquire a fresh PID after restart",
+            )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
 
