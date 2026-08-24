@@ -69,7 +69,6 @@ class UpdateReceipt:
             "steps": [],
             "skips": [],
             "gateway_restart": {},
-            "dashboard_restart": {},
             "fleet": [],
         }
         try:
@@ -112,9 +111,6 @@ class UpdateReceipt:
             "incomplete": bool(incomplete),
             "phase_error": phase_error,
         }
-
-    def dashboard_restart_result(self, **result: Any) -> None:
-        self.data["dashboard_restart"] = dict(result)
 
     def finalize(self, outcome: str) -> None:
         self.data["outcome"] = outcome
@@ -168,34 +164,6 @@ def record_gateway_restart(**kwargs: Any) -> None:
             _current.gateway_restart_result(**kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not record gateway restart result: %s", exc)
-
-
-def record_dashboard_restart(**kwargs: Any) -> None:
-    """Record the post-update macOS dashboard LaunchAgent decision."""
-    try:
-        if _current is not None:
-            _current.dashboard_restart_result(**kwargs)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not record dashboard restart result: %s", exc)
-
-
-def dashboard_restart_due(post_update_sha: str | None) -> bool:
-    """True once per newly-observed post-update SHA."""
-    if not post_update_sha:
-        return False
-    try:
-        if _current is not None:
-            pre_sha = (_current.data.get("pre_update") or {}).get("sha")
-            if pre_sha == post_update_sha:
-                return False
-        latest = read_latest_receipt() or {}
-        prior = latest.get("dashboard_restart") or {}
-        return not (
-            prior.get("attempted")
-            and prior.get("post_update_sha") == post_update_sha
-        )
-    except Exception:
-        return False
 
 
 def finalize_update_receipt(

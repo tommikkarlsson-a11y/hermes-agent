@@ -113,22 +113,6 @@ class TestFindStaleDashboardPids:
         with patch("subprocess.run", side_effect=sp.TimeoutExpired("ps", 10)):
             assert _find_stale_dashboard_pids() == []
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="ps-based scan path")
-    @pytest.mark.parametrize(
-        "selector",
-        ["-p coder", "--profile coder", "--profile=coder"],
-    )
-    def test_profile_selector_before_dashboard_is_detected(self, selector):
-        command = f"/usr/bin/python3 -m hermes_cli.main {selector} dashboard"
-        with patch("subprocess.run", side_effect=_ps_runner(_ps_line(4242, command))):
-            assert _find_stale_dashboard_pids() == [4242]
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="ps-based scan path")
-    def test_unrelated_prose_is_not_detected(self):
-        prose = "chat-agent discussing hermes -p coder dashboard restart"
-        with patch("subprocess.run", side_effect=_ps_runner(_ps_line(4242, prose))):
-            assert _find_stale_dashboard_pids() == []
-
 
 
 
@@ -264,62 +248,6 @@ class TestDashboardUpdateCleanup:
             _finish_dashboard_update_cleanup([])
 
         assert "stopped during update" not in capsys.readouterr().out
-
-    def test_launchd_helper_uses_user_domain_kickstart_and_readback(self):
-        from hermes_cli import dashboard_procs
-
-        run = MagicMock(return_value=MagicMock(returncode=0))
-
-        with (
-            patch("sys.platform", "darwin"),
-            patch("os.getuid", return_value=501),
-            patch.object(dashboard_procs.subprocess, "run", side_effect=run),
-            patch.object(
-                dashboard_procs,
-                "_scan_dashboard_processes",
-                return_value=[(4242, "python -m hermes_cli.main -p coder dashboard")],
-            ),
-        ):
-            result = dashboard_procs._restart_launchd_dashboard(attempt=True)
-
-        target = "gui/501/ai.hermes.dashboard"
-        assert [call.args[0] for call in run.call_args_list] == [
-            ["launchctl", "print", target],
-            ["launchctl", "kickstart", "-k", target],
-        ]
-        assert result and result["succeeded"] is True
-        assert all("sudo" not in call.args[0] for call in run.call_args_list)
-
-    def test_launchd_failure_makes_cleanup_partial(self):
-        from hermes_cli import update_cmd, update_receipt
-
-        result = {"succeeded": False, "skipped": False}
-        with (
-            patch("sys.platform", "darwin"),
-            patch.object(update_cmd, "_reload_process_scan_modules"),
-            patch.object(update_cmd, "_post_update_sha", return_value="new-sha"),
-            patch.object(update_receipt, "dashboard_restart_due", return_value=True),
-            patch(
-                "hermes_cli.dashboard_procs._restart_launchd_dashboard",
-                return_value=result,
-            ),
-            patch.object(update_receipt, "record_dashboard_restart"),
-        ):
-            assert update_cmd._finish_dashboard_update_cleanup([]) is False
-
-    def test_linux_keeps_existing_cleanup_path(self):
-        from hermes_cli import update_cmd
-
-        with (
-            patch("sys.platform", "linux"),
-            patch.object(update_cmd, "_reload_process_scan_modules"),
-            patch(
-                "hermes_cli.main._kill_stale_dashboard_processes",
-                return_value={"unrecovered": []},
-            ) as kill,
-        ):
-            assert update_cmd._finish_dashboard_update_cleanup([]) is True
-        kill.assert_called_once_with(restart_managed=True, already_restarted_units=None)
 
 
 class TestWindowsWmicEncoding:

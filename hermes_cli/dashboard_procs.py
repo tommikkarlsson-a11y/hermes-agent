@@ -13,7 +13,6 @@ patches on ``hermes_cli.main`` resolve unchanged.
 """
 
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +53,17 @@ def _scan_dashboard_processes(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
+    patterns = [
+        "hermes dashboard",
+        "hermes_cli.main dashboard",
+        "hermes_cli/main.py dashboard",
+        # The headless backend (`hermes serve`) is the same long-lived server
+        # under a different command name — the desktop app spawns it. Reap it
+        # on update for the same frontend/backend-mismatch reason.
+        "hermes serve",
+        "hermes_cli.main serve",
+        "hermes_cli/main.py serve",
+    ]
     self_pid = os.getpid()
     dashboard_processes: list[tuple[int, str]] = []
 
@@ -91,8 +101,7 @@ def _scan_dashboard_processes(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
-                        _dashboard_subcommand_index(_split_cmdline(current_cmd))
-                        is not None
+                        any(p in current_cmd for p in patterns)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -125,10 +134,7 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if (
-                        _dashboard_subcommand_index(_split_cmdline(command)) is not None
-                        and pid != self_pid
-                    ):
+                    if any(p in command for p in patterns) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -180,103 +186,10 @@ def _is_ephemeral_port_zero_backend(argv: list[str]) -> bool:
 
 
 def _dashboard_subcommand_index(argv: list[str]) -> int | None:
-    """Classify a real Hermes dashboard argv and return its subcommand index."""
-    if not argv:
-        return None
-    executable = Path(str(argv[0]).strip('"')).name.lower()
-    if executable in ("hermes", "hermes.exe"):
-        i = 1
-    elif executable.startswith("python"):
-        if len(argv) >= 3 and argv[1:3] == ["-m", "hermes_cli.main"]:
-            i = 3
-        elif len(argv) >= 2 and str(argv[1]).replace("\\", "/").endswith(
-            "hermes_cli/main.py"
-        ):
-            i = 2
-        else:
-            return None
-    else:
-        return None
-
-    while i < len(argv):
-        token = str(argv[i])
-        if token in ("-p", "--profile"):
-            if i + 1 >= len(argv) or not str(argv[i + 1]).strip():
-                return None
-            i += 2
-            continue
-        if token.startswith("--profile=") and token.split("=", 1)[1]:
-            i += 1
-            continue
-        return i if token in ("serve", "dashboard") else None
+    for i, tok in enumerate(argv):
+        if tok in ("serve", "dashboard"):
+            return i
     return None
-
-
-def _split_cmdline(command: str) -> list[str]:
-    try:
-        return shlex.split(command, posix=sys.platform != "win32")
-    except ValueError:
-        return []
-
-
-_LAUNCHD_DASHBOARD_LABEL = "ai.hermes.dashboard"
-
-
-def _restart_launchd_dashboard(*, attempt: bool) -> dict[str, object] | None:
-    """Restart the loaded macOS Dashboard LaunchAgent and verify rediscovery."""
-    if sys.platform != "darwin":
-        return None
-    label = _LAUNCHD_DASHBOARD_LABEL
-    target = f"gui/{os.getuid()}/{label}"
-    try:
-        loaded = subprocess.run(
-            ["launchctl", "print", target],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return {
-            "attempted": False,
-            "succeeded": False,
-            "skipped": False,
-            "reason": "launchctl_probe_failed",
-            "label": label,
-        }
-    if loaded.returncode != 0:
-        return None
-    if not attempt:
-        return {
-            "attempted": False,
-            "succeeded": False,
-            "skipped": True,
-            "reason": "same_head_already_handled",
-            "label": label,
-        }
-    try:
-        restarted = subprocess.run(
-            ["launchctl", "kickstart", "-k", target],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        restarted = None
-    if restarted is None or restarted.returncode != 0:
-        reason = "kickstart_failed"
-        succeeded = False
-    else:
-        succeeded = bool(_scan_dashboard_processes())
-        reason = (
-            "restarted_and_rediscovered" if succeeded else "process_not_rediscovered"
-        )
-    return {
-        "attempted": True,
-        "succeeded": succeeded,
-        "skipped": False,
-        "reason": reason,
-        "label": label,
-    }
 
 
 def _normalize_dashboard_cmdline(argv: list[str]) -> tuple[str, ...]:
