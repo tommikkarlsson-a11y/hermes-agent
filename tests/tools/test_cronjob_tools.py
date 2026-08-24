@@ -387,6 +387,69 @@ class TestUnifiedCronjobTool:
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
+    def test_registry_dispatch_persists_desktop_session_contract(self):
+        """The model-facing Desktop boundary must not drop cron context fields."""
+        from cron.jobs import get_job
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.registry import registry
+
+        tokens = set_session_vars(
+            session_key="desktop-session",
+            session_id="desktop-session",
+            source="desktop",
+            async_delivery=False,
+        )
+        try:
+            created = json.loads(
+                registry.dispatch(
+                    "cronjob",
+                    {
+                        "action": "create",
+                        "prompt": "Continue the briefing",
+                        "schedule": "every 1h",
+                        "deliver": "origin",
+                        "attach_to_session": True,
+                        "continuity": True,
+                    },
+                    session_id="desktop-session",
+                )
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["origin"] == {
+            "platform": "api_server",
+            "chat_id": "desktop-session",
+            "chat_name": None,
+            "thread_id": None,
+            "user_id": None,
+            "scope_id": None,
+        }
+        assert stored["attach_to_session"] is True
+        assert stored["context_from"] == ["self"]
+
+        updated = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": created["job_id"],
+                    "attach_to_session": False,
+                    "continuity": False,
+                },
+                session_id="desktop-session",
+            )
+        )
+        assert updated["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert stored["origin"]["chat_id"] == "desktop-session"
+        assert stored["attach_to_session"] is False
+        assert stored["context_from"] is None
+
 
 # =========================================================================
 # Agent-facing surface: per-job model pins are user-owned
