@@ -69,7 +69,6 @@ class UpdateReceipt:
             "steps": [],
             "skips": [],
             "gateway_restart": {},
-            "dashboard_restart": {},
             "fleet": [],
         }
         try:
@@ -112,9 +111,6 @@ class UpdateReceipt:
             "incomplete": bool(incomplete),
             "phase_error": phase_error,
         }
-
-    def dashboard_restart_result(self, result: dict[str, Any]) -> None:
-        self.data["dashboard_restart"] = dict(result)
 
     def finalize(self, outcome: str) -> None:
         self.data["outcome"] = outcome
@@ -168,38 +164,6 @@ def record_gateway_restart(**kwargs: Any) -> None:
             _current.gateway_restart_result(**kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not record gateway restart result: %s", exc)
-
-
-def record_dashboard_restart(result: dict[str, Any]) -> None:
-    """Record the managed Dashboard restart result. Never raises."""
-    try:
-        if _current is not None:
-            _current.dashboard_restart_result(result)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not record dashboard restart result: %s", exc)
-
-
-def dashboard_restart_attempted_for_sha(post_update_sha: str) -> bool:
-    """Whether this or the latest update already attempted this exact SHA."""
-    if not post_update_sha:
-        return False
-    try:
-        candidates: list[dict[str, Any]] = []
-        if _current is not None:
-            candidates.append(_current.data)
-        latest = read_latest_receipt()
-        if latest:
-            candidates.append(latest)
-        for payload in candidates:
-            restart = payload.get("dashboard_restart") or {}
-            if (
-                (restart.get("attempted") or restart.get("already_attempted"))
-                and restart.get("post_update_sha") == post_update_sha
-            ):
-                return True
-    except Exception:
-        pass
-    return False
 
 
 def finalize_update_receipt(

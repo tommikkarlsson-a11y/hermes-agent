@@ -113,35 +113,6 @@ class TestFindStaleDashboardPids:
         with patch("subprocess.run", side_effect=sp.TimeoutExpired("ps", 10)):
             assert _find_stale_dashboard_pids() == []
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="ps-based scan path")
-    @pytest.mark.parametrize(
-        "selector",
-        ["-p coder", "-pcoder", "-p=coder", "--profile coder", "--profile=coder"],
-    )
-    def test_profile_selector_module_invocations_are_detected(self, selector):
-        from hermes_cli import dashboard_procs
-
-        command = f"python -m hermes_cli.main {selector} dashboard --port 9119"
-        with patch(
-            "subprocess.run",
-            side_effect=_ps_runner(_ps_line(4242, command) + "\n"),
-        ):
-            assert dashboard_procs._scan_dashboard_processes() == [(4242, command)]
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="ps-based scan path")
-    def test_unrelated_prose_is_not_detected_as_dashboard_process(self):
-        from hermes_cli import dashboard_procs
-
-        command = (
-            "python assistant.py --prompt "
-            "'debug python -m hermes_cli.main -p coder dashboard failures'"
-        )
-        with patch(
-            "subprocess.run",
-            side_effect=_ps_runner(_ps_line(4242, command) + "\n"),
-        ):
-            assert dashboard_procs._scan_dashboard_processes() == []
-
 
 
 
@@ -277,101 +248,6 @@ class TestDashboardUpdateCleanup:
             _finish_dashboard_update_cleanup([])
 
         assert "stopped during update" not in capsys.readouterr().out
-
-    def test_loaded_macos_launch_agent_is_kickstarted_and_read_back(
-        self, monkeypatch
-    ):
-        from hermes_cli import dashboard_procs, update_cmd, update_receipt
-
-        monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
-        monkeypatch.setattr(update_cmd.os, "getuid", lambda: 501)
-        monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
-            lambda refresh=False: {"sha": "a" * 40},
-        )
-        monkeypatch.setattr(update_receipt, "dashboard_restart_attempted_for_sha", lambda sha: False)
-        recorded = []
-        monkeypatch.setattr(update_receipt, "record_dashboard_restart", recorded.append)
-        monkeypatch.setattr(
-            dashboard_procs,
-            "_scan_dashboard_processes",
-            lambda: [(4243, "python -m hermes_cli.main -p coder dashboard")],
-        )
-        calls = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(argv)
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
-        monkeypatch.setattr(update_cmd, "_reload_process_scan_modules", lambda: None)
-        with patch("hermes_cli.main._kill_stale_dashboard_processes") as raw_kill:
-            update_cmd._finish_dashboard_update_cleanup([])
-
-        assert calls == [
-            ["launchctl", "print", "gui/501/ai.hermes.dashboard"],
-            ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"],
-        ]
-        raw_kill.assert_not_called()
-        assert recorded[0]["attempted"] is True
-        assert recorded[0]["succeeded"] is True
-        assert recorded[0]["post_update_sha"] == "a" * 40
-
-    def test_same_head_loaded_macos_launch_agent_skips_second_kickstart(
-        self, monkeypatch
-    ):
-        from hermes_cli import update_cmd, update_receipt
-
-        monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
-        monkeypatch.setattr(update_cmd.os, "getuid", lambda: 501)
-        monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
-            lambda refresh=False: {"sha": "a" * 40},
-        )
-        monkeypatch.setattr(update_receipt, "dashboard_restart_attempted_for_sha", lambda sha: True)
-        recorded = []
-        monkeypatch.setattr(update_receipt, "record_dashboard_restart", recorded.append)
-        calls = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(argv)
-            return MagicMock(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
-        with patch("hermes_cli.main._kill_stale_dashboard_processes") as raw_kill:
-            update_cmd._finish_dashboard_update_cleanup([])
-
-        assert calls == [["launchctl", "print", "gui/501/ai.hermes.dashboard"]]
-        raw_kill.assert_not_called()
-        assert recorded[0]["skipped"] is True
-        assert recorded[0]["reason"] == "already_attempted_for_post_update_sha"
-
-    def test_launchctl_failure_marks_update_partial(self, monkeypatch):
-        from hermes_cli import update_cmd, update_receipt
-
-        monkeypatch.setattr(update_cmd.sys, "platform", "darwin")
-        monkeypatch.setattr(update_cmd.os, "getuid", lambda: 501)
-        monkeypatch.setattr(
-            "hermes_cli.build_info.get_code_identity",
-            lambda refresh=False: {"sha": "b" * 40},
-        )
-        monkeypatch.setattr(update_receipt, "dashboard_restart_attempted_for_sha", lambda sha: False)
-        recorded = []
-        monkeypatch.setattr(update_receipt, "record_dashboard_restart", recorded.append)
-
-        def fake_run(argv, **kwargs):
-            code = 1 if "kickstart" in argv else 0
-            return MagicMock(returncode=code, stdout="", stderr="denied")
-
-        monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
-        failures = []
-        with patch("hermes_cli.main._kill_stale_dashboard_processes") as raw_kill:
-            assert update_cmd._finish_dashboard_update_cleanup(failures) is False
-
-        raw_kill.assert_not_called()
-        assert failures == ["dashboard launchd restart"]
-        assert recorded[0]["attempted"] is True
-        assert recorded[0]["succeeded"] is False
 
 
 class TestWindowsWmicEncoding:

@@ -121,51 +121,6 @@ class TestReceiptLifecycle:
     def test_read_latest_receipt_missing(self, receipt_home):
         assert ur.read_latest_receipt() is None
 
-    def test_dashboard_restart_attempt_is_gated_by_post_update_sha(self, receipt_home):
-        ur.begin_update_receipt()
-        sha = "a" * 40
-        assert ur.dashboard_restart_attempted_for_sha(sha) is False
-        ur.record_dashboard_restart(
-            {
-                "attempted": True,
-                "succeeded": False,
-                "skipped": False,
-                "reason": "launchctl_failed",
-                "label": "ai.hermes.dashboard",
-                "post_update_sha": sha,
-            }
-        )
-        assert ur.dashboard_restart_attempted_for_sha(sha) is True
-        assert ur.dashboard_restart_attempted_for_sha("b" * 40) is False
-
-    def test_latest_receipt_gates_same_head_but_not_new_head(self, receipt_home):
-        old_sha = "a" * 40
-        ur.begin_update_receipt()
-        ur.record_dashboard_restart(
-            {
-                "attempted": True,
-                "succeeded": True,
-                "skipped": False,
-                "reason": "restarted_and_rediscovered",
-                "label": "ai.hermes.dashboard",
-                "post_update_sha": old_sha,
-            }
-        )
-        _finalize("success")
-        ur.begin_update_receipt()
-        assert ur.dashboard_restart_attempted_for_sha(old_sha) is True
-        assert ur.dashboard_restart_attempted_for_sha("b" * 40) is False
-        ur.record_dashboard_restart(
-            {
-                "attempted": False,
-                "already_attempted": True,
-                "post_update_sha": old_sha,
-            }
-        )
-        _finalize("success")
-        ur.begin_update_receipt()
-        assert ur.dashboard_restart_attempted_for_sha(old_sha) is True
-
 
 class TestCommandBoundaryFinalization:
     """Receipt lifetime is owned by the update-command boundary (#91283 review).
