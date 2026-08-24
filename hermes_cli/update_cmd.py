@@ -856,9 +856,18 @@ def _reload_process_scan_modules() -> None:
                 )
 
 
+def _post_update_sha() -> str | None:
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        return (get_code_identity(refresh=True) or {}).get("sha")
+    except Exception:
+        return None
+
+
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
-) -> None:
+) -> bool:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
     *already_restarted_units* forwards the systemd unit names (no
@@ -870,17 +879,42 @@ def _finish_dashboard_update_cleanup(
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
-        return
+        return True
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
     # both modules reflect the freshly-updated source before touching them.
     _reload_process_scan_modules()
 
+    if sys.platform == "darwin":
+        from hermes_cli import update_receipt
+        from hermes_cli.dashboard_procs import _restart_launchd_dashboard
+
+        post_sha = _post_update_sha()
+        launchd_result = _restart_launchd_dashboard(
+            attempt=update_receipt.dashboard_restart_due(post_sha)
+        )
+        if launchd_result is not None:
+            update_receipt.record_dashboard_restart(
+                **launchd_result, post_update_sha=post_sha
+            )
+            if not launchd_result["succeeded"] and not launchd_result["skipped"]:
+                print("⚠ Failed to restart macOS Dashboard LaunchAgent.")
+                return False
+            return True
+        update_receipt.record_dashboard_restart(
+            attempted=False,
+            succeeded=False,
+            skipped=True,
+            reason="label_not_loaded",
+            label="ai.hermes.dashboard",
+            post_update_sha=post_sha,
+        )
+
     stop_result = _m()._kill_stale_dashboard_processes(
         restart_managed=True, already_restarted_units=already_restarted_units
     )
     if not stop_result.get("unrecovered"):
-        return
+        return True
 
     print()
     print(
@@ -889,6 +923,8 @@ def _finish_dashboard_update_cleanup(
     )
     print("  Re-launch it when you want the web UI back:")
     print("    hermes dashboard --port <port>")
+    return True
+
 
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
@@ -1920,16 +1956,20 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    _finish_dashboard_update_cleanup(node_failures)
+    dashboard_cleanup_ok = (
+        _finish_dashboard_update_cleanup(node_failures) is not False
+    )
     try:
         from hermes_cli.update_receipt import finalize_update_receipt
 
         finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
+            "success"
+            if (desktop_build_ok and not node_failures and dashboard_cleanup_ok)
+            else "partial"
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return desktop_build_ok and dashboard_cleanup_ok
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -8284,9 +8324,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
+        if _finish_dashboard_update_cleanup(
             node_failures, already_restarted_units=set(restarted_services)
-        )
+        ) is False:
+            gateway_fleet_restart_incomplete = True
 
         print()
         print("Tip: You can now select a provider and model:")

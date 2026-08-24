@@ -121,6 +121,21 @@ class TestReceiptLifecycle:
     def test_read_latest_receipt_missing(self, receipt_home):
         assert ur.read_latest_receipt() is None
 
+    def test_dashboard_restart_same_head_skips_new_head_reattempts(
+        self, receipt_home
+    ):
+        ur.begin_update_receipt()
+        assert ur.dashboard_restart_due("sha-1") is True
+        ur.record_dashboard_restart(
+            attempted=True,
+            post_update_sha="sha-1",
+        )
+        _finalize("partial")
+
+        ur.begin_update_receipt()
+        assert ur.dashboard_restart_due("sha-1") is False
+        assert ur.dashboard_restart_due("sha-2") is True
+
 
 class TestCommandBoundaryFinalization:
     """Receipt lifetime is owned by the update-command boundary (#91283 review).
