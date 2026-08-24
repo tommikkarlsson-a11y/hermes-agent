@@ -858,7 +858,7 @@ def _reload_process_scan_modules() -> None:
 
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
-) -> None:
+) -> bool:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
     *already_restarted_units* forwards the systemd unit names (no
@@ -870,17 +870,24 @@ def _finish_dashboard_update_cleanup(
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
-        return
+        return True
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
     # both modules reflect the freshly-updated source before touching them.
     _reload_process_scan_modules()
 
+    launchd_result = _restart_macos_dashboard_launch_agent()
+    if launchd_result is not None:
+        if launchd_result.get("attempted") and not launchd_result.get("succeeded"):
+            node_failures.append("dashboard launchd restart")
+            return False
+        return True
+
     stop_result = _m()._kill_stale_dashboard_processes(
         restart_managed=True, already_restarted_units=already_restarted_units
     )
     if not stop_result.get("unrecovered"):
-        return
+        return True
 
     print()
     print(
@@ -889,6 +896,111 @@ def _finish_dashboard_update_cleanup(
     )
     print("  Re-launch it when you want the web UI back:")
     print("    hermes dashboard --port <port>")
+    return True
+
+
+def _restart_macos_dashboard_launch_agent() -> "dict[str, object] | None":
+    """Kickstart the loaded user Dashboard LaunchAgent once per updated SHA.
+
+    ``None`` means this LaunchAgent does not own the process and the existing
+    systemd/manual/Desktop handling should continue. A result means launchd
+    owns it, so the cleanup must never raw-kill its PID.
+    """
+    if sys.platform != "darwin":
+        return None
+
+    label = "ai.hermes.dashboard"
+    target = f"gui/{os.getuid()}/{label}"
+    common: dict[str, object] = {"label": label, "post_update_sha": ""}
+    try:
+        loaded = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if loaded.returncode != 0:
+        return None
+
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        common["post_update_sha"] = str(
+            (get_code_identity(refresh=True) or {}).get("sha") or ""
+        )
+    except Exception:
+        pass
+
+    from hermes_cli.update_receipt import (
+        dashboard_restart_attempted_for_sha,
+        record_dashboard_restart,
+    )
+
+    post_update_sha = str(common["post_update_sha"])
+    if dashboard_restart_attempted_for_sha(post_update_sha):
+        result = {
+            **common,
+            "attempted": False,
+            "already_attempted": True,
+            "succeeded": False,
+            "skipped": True,
+            "reason": "already_attempted_for_post_update_sha",
+        }
+        record_dashboard_restart(result)
+        return result
+
+    try:
+        kickstart = subprocess.run(
+            ["launchctl", "kickstart", "-k", target],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        result = {
+            **common,
+            "attempted": True,
+            "succeeded": False,
+            "skipped": False,
+            "reason": f"launchctl_error: {exc}",
+        }
+        record_dashboard_restart(result)
+        return result
+
+    if kickstart.returncode != 0:
+        detail = (kickstart.stderr or kickstart.stdout or "").strip()
+        result = {
+            **common,
+            "attempted": True,
+            "succeeded": False,
+            "skipped": False,
+            "reason": f"launchctl_failed: {detail}" if detail else "launchctl_failed",
+        }
+        record_dashboard_restart(result)
+        return result
+
+    from hermes_cli.dashboard_procs import _scan_dashboard_processes
+
+    rediscovered = _scan_dashboard_processes()
+    result = {
+        **common,
+        "attempted": True,
+        "succeeded": bool(rediscovered),
+        "skipped": False,
+        "reason": (
+            "restarted_and_rediscovered"
+            if rediscovered
+            else "restart_not_rediscovered"
+        ),
+    }
+    record_dashboard_restart(result)
+    return result
 
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
@@ -1920,7 +2032,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    _finish_dashboard_update_cleanup(node_failures)
+    dashboard_cleanup_ok = _finish_dashboard_update_cleanup(node_failures)
     try:
         from hermes_cli.update_receipt import finalize_update_receipt
 
@@ -1929,7 +2041,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         )
     except Exception as _receipt_exc:
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
-    return desktop_build_ok
+    return desktop_build_ok and dashboard_cleanup_ok
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -8284,9 +8396,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
+        if not _finish_dashboard_update_cleanup(
             node_failures, already_restarted_units=set(restarted_services)
-        )
+        ):
+            gateway_fleet_restart_incomplete = True
 
         print()
         print("Tip: You can now select a provider and model:")

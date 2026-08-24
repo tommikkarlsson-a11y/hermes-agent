@@ -13,6 +13,7 @@ patches on ``hermes_cli.main`` resolve unchanged.
 """
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,54 @@ def _m():
     from hermes_cli import main
 
     return main
+
+
+def _is_dashboard_argv(argv: list[str]) -> bool:
+    """Return whether *argv* is a real Hermes dashboard/serve invocation."""
+    if not argv:
+        return False
+    executable = Path(argv[0].strip('"')).name.lower()
+    index = 1
+    if executable in ("hermes", "hermes.exe"):
+        pass
+    elif executable.startswith(("python", "pythonw")):
+        if len(argv) >= 3 and argv[1:3] == ["-m", "hermes_cli.main"]:
+            index = 3
+        elif len(argv) >= 2 and argv[1].replace("\\", "/").endswith(
+            "hermes_cli/main.py"
+        ):
+            index = 2
+        else:
+            return False
+    else:
+        return False
+
+    while index < len(argv):
+        token = argv[index]
+        if token in ("-p", "--profile"):
+            if index + 1 >= len(argv) or not argv[index + 1]:
+                return False
+            index += 2
+            continue
+        if token.startswith("--profile=") and token.split("=", 1)[1]:
+            index += 1
+            continue
+        if token.startswith("-p") and token != "-p":
+            value = token[2:].removeprefix("=")
+            if not value:
+                return False
+            index += 1
+            continue
+        return token in ("dashboard", "serve")
+    return False
+
+
+def _is_dashboard_command(command: str) -> bool:
+    try:
+        argv = shlex.split(command, posix=sys.platform != "win32")
+    except ValueError:
+        return False
+    return _is_dashboard_argv([token.strip('"') for token in argv])
 
 
 def _scan_dashboard_processes(
@@ -53,17 +102,6 @@ def _scan_dashboard_processes(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-        # The headless backend (`hermes serve`) is the same long-lived server
-        # under a different command name — the desktop app spawns it. Reap it
-        # on update for the same frontend/backend-mismatch reason.
-        "hermes serve",
-        "hermes_cli.main serve",
-        "hermes_cli/main.py serve",
-    ]
     self_pid = os.getpid()
     dashboard_processes: list[tuple[int, str]] = []
 
@@ -101,7 +139,7 @@ def _scan_dashboard_processes(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
-                        any(p in current_cmd for p in patterns)
+                        _is_dashboard_command(current_cmd)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -134,7 +172,7 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if _is_dashboard_command(command) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
