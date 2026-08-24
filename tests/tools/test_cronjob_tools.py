@@ -394,10 +394,9 @@ class TestUnifiedCronjobTool:
         from tools.registry import registry
 
         tokens = set_session_vars(
-            platform="api_server",
-            chat_id="desktop-session",
             session_key="desktop-session",
             session_id="desktop-session",
+            source="desktop",
             async_delivery=False,
         )
         try:

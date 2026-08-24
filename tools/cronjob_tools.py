@@ -317,6 +317,12 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    if not origin_platform or not origin_chat_id:
+        source = get_session_env("HERMES_SESSION_SOURCE")
+        session_id = get_session_env("HERMES_SESSION_ID")
+        if source == "desktop" and session_id:
+            origin_platform = "api_server"
+            origin_chat_id = session_id
     if origin_platform and origin_chat_id:
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
         # Slack thread-per-message session keying (native parity: thread_ts =
@@ -369,8 +375,8 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
     """Return an informational notice when a created job won't deliver anywhere.
 
-    TUI/CLI sessions cannot be captured as a cron ``origin`` (no
-    ``HERMES_SESSION_PLATFORM``/``CHAT_ID`` is set for them), so a
+    TUI/CLI sessions cannot be captured as a cron ``origin`` (no live-delivery
+    session identity is set for them), so a
     ``deliver="origin"`` request — or an omitted ``deliver`` that defaults to
     origin-or-local — produces a job that runs and saves output to
     ``last_output`` but is never delivered back into the session. This is by
