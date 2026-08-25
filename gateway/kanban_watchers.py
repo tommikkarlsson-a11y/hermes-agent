@@ -239,7 +239,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "queue_pressure", "queue_pressure_recovered")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -636,6 +636,18 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "queue_pressure":
+                            delay = 0
+                            if ev.payload and ev.payload.get("delay_seconds"):
+                                delay = int(ev.payload["delay_seconds"])
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} queue pressure"
+                                f" — ready and unclaimed for {delay}s despite available capacity"
+                            )
+                        elif kind == "queue_pressure_recovered":
+                            msg = (
+                                f"✓ {board_tag}{tag}Kanban {sub['task_id']} queue pressure recovered"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -1493,7 +1505,7 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1504,6 +1516,27 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
+                try:
+                    transitions = _kb.reconcile_queue_pressure(
+                        conn,
+                        dispatch_interval_seconds=interval,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        board=slug,
+                        memory_pressure=result.memory_pressure,
+                    )
+                    if transitions:
+                        logger.info(
+                            "kanban dispatcher [%s]: queue transitions=%s",
+                            slug, transitions,
+                        )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: queue-pressure reconciliation failed on board %s",
+                        slug,
+                    )
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

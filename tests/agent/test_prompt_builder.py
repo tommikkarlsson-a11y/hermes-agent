@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
+    KANBAN_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
@@ -71,6 +72,14 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_dispatcher_worker_contract_is_one_card_only(self):
+        assert "Finish only your own task" in KANBAN_GUIDANCE
+        assert "must not create, assign, link, unlink, unblock, inspect" in KANBAN_GUIDANCE
+        assert "must not use `delegate_task`" in KANBAN_GUIDANCE
+        assert "direct orchestrator control session may build or revise the graph" in KANBAN_GUIDANCE
+        assert "## Orchestrator mode" not in KANBAN_GUIDANCE
+        assert "If follow-up work appears, create it" not in KANBAN_GUIDANCE
 
 
 # =========================================================================

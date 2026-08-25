@@ -81,6 +81,62 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_queue_pressure_and_recovery_use_native_notifier_path(tmp_path, monkeypatch):
+    db_path = tmp_path / "queue-pressure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="delayed", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+        )
+        conn.execute("UPDATE tasks SET created_at = 900 WHERE id = ?", (task_id,))
+        conn.execute(
+            "UPDATE task_events SET created_at = 900 WHERE task_id = ?", (task_id,)
+        )
+        conn.commit()
+        assert kb.reconcile_queue_pressure(
+            conn,
+            dispatch_interval_seconds=10,
+            max_in_progress=4,
+            max_in_progress_per_profile=1,
+            now=1_000,
+        ) == [(task_id, "queue_pressure")]
+    finally:
+        conn.close()
+
+    pressure_adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(pressure_adapter)))
+    assert len(pressure_adapter.sent) == 1
+    assert "queue pressure" in pressure_adapter.sent[0]["text"]
+    assert "available capacity" in pressure_adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = 'running', claim_lock = 'worker' WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.reconcile_queue_pressure(
+            conn,
+            dispatch_interval_seconds=10,
+            max_in_progress=4,
+            max_in_progress_per_profile=1,
+            now=1_001,
+        ) == [(task_id, "queue_pressure_recovered")]
+    finally:
+        conn.close()
+
+    recovery_adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovery_adapter)))
+    assert len(recovery_adapter.sent) == 1
+    assert "queue pressure recovered" in recovery_adapter.sent[0]["text"]
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

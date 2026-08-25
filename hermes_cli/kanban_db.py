@@ -9738,6 +9738,138 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
+def reconcile_queue_pressure(
+    conn: sqlite3.Connection,
+    *,
+    dispatch_interval_seconds: float,
+    max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    board: Optional[str] = None,
+    memory_pressure: Optional[str] = None,
+    now: Optional[int] = None,
+) -> list[tuple[str, str]]:
+    """Emit deduplicated queue-pressure transitions through ``task_events``.
+
+    A subscribed card is under queue pressure only when it has remained
+    unclaimed in ``ready`` for more than two live dispatcher intervals while
+    both the host and its assignee have dispatch capacity. Capacity saturation
+    is normal load, not a dispatcher fault. The latest pressure/recovery event
+    is the durable state bit, so restarts cannot duplicate notifications.
+    """
+    try:
+        interval = max(float(dispatch_interval_seconds), 1.0)
+    except (TypeError, ValueError):
+        interval = 60.0
+    current_time = int(time.time()) if now is None else int(now)
+    threshold = 2.0 * interval
+
+    local_running = count_running_tasks(conn)
+    host_running = local_running + count_running_tasks_other_boards(board)
+    host_has_capacity = memory_pressure is None
+    for cap in (max_spawn, max_in_progress):
+        if isinstance(cap, int) and cap > 0 and host_running >= cap:
+            host_has_capacity = False
+
+    profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    profile_running = {
+        row["assignee"]: int(row["n"])
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        )
+    }
+    rows = conn.execute(
+        "SELECT t.id, t.status, t.assignee, t.claim_lock, t.created_at "
+        "FROM tasks t WHERE EXISTS ("
+        "  SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = t.id"
+        ")"
+    ).fetchall()
+
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+
+    def _ready_since(task_id: str, fallback: int) -> int:
+        events = conn.execute(
+            "SELECT kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        for event in events:
+            kind = event["kind"]
+            if kind in {"promoted", "rate_limited", "crashed", "timed_out"}:
+                return int(event["created_at"])
+            if kind in {"unblocked", "status", "created"}:
+                try:
+                    payload = json.loads(event["payload"]) if event["payload"] else {}
+                except (TypeError, ValueError):
+                    payload = {}
+                status = payload.get("status") if isinstance(payload, dict) else None
+                if status in (None, "ready"):
+                    return int(event["created_at"])
+        return int(fallback)
+
+    transitions: list[tuple[str, str]] = []
+    with write_txn(conn):
+        for row in rows:
+            latest = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind IN ('queue_pressure', 'queue_pressure_recovered') "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            pressure_active = bool(latest and latest["kind"] == "queue_pressure")
+            assignee = row["assignee"]
+            assignee_has_capacity = bool(assignee)
+            if assignee_has_capacity and profile_exists is not None:
+                assignee_has_capacity = bool(profile_exists(assignee))
+            running_for_profile = profile_running.get(assignee, 0) if assignee else 0
+            if profile_cap is not None and running_for_profile >= profile_cap:
+                assignee_has_capacity = False
+
+            ready_since = _ready_since(row["id"], row["created_at"])
+            delayed = (current_time - ready_since) > threshold
+            should_pressure = bool(
+                row["status"] == "ready"
+                and not row["claim_lock"]
+                and delayed
+                and host_has_capacity
+                and assignee_has_capacity
+            )
+
+            if should_pressure and not pressure_active:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "queue_pressure",
+                    {
+                        "assignee": assignee,
+                        "delay_seconds": max(0, current_time - ready_since),
+                        "dispatch_interval_seconds": interval,
+                        "global_running": host_running,
+                        "profile_running": running_for_profile,
+                    },
+                )
+                transitions.append((row["id"], "queue_pressure"))
+            elif pressure_active and not should_pressure:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "queue_pressure_recovered",
+                    {"status": row["status"], "assignee": assignee},
+                )
+                transitions.append((row["id"], "queue_pressure_recovered"))
+    return transitions
+
+
 def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
