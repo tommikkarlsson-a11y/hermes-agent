@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+from difflib import SequenceMatcher
 import importlib
 import json
 import logging
@@ -40,6 +41,7 @@ import queue
 import sys
 import threading
 import time
+import unicodedata
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -68,6 +70,43 @@ class _RecallResult:
 
     text: str
     count: int
+
+
+def _normalize_recall_text(text: str) -> str:
+    """Normalize text for deterministic duplicate comparison."""
+    folded = text.casefold()
+    without_punctuation = "".join(
+        " " if unicodedata.category(char).startswith("P") else char
+        for char in folded
+    )
+    return " ".join(without_punctuation.split())
+
+
+def _recall_texts_are_near_duplicates(first: str, second: str) -> bool:
+    """Conservatively match long texts that differ only by a small edit."""
+    if min(len(first), len(second)) < 48:
+        return False
+    return SequenceMatcher(None, first, second, autojunk=False).ratio() >= 0.95
+
+
+def _deduplicate_recall_results(results: Any) -> List[Any]:
+    """Keep the first server-ranked result from each duplicate group."""
+    kept: List[Any] = []
+    normalized_kept: List[str] = []
+    for result in results or []:
+        text = getattr(result, "text", "")
+        normalized = _normalize_recall_text(text) if text else ""
+        if not normalized:
+            continue
+        if any(
+            normalized == prior
+            or _recall_texts_are_near_duplicates(normalized, prior)
+            for prior in normalized_kept
+        ):
+            continue
+        kept.append(result)
+        normalized_kept.append(normalized)
+    return kept
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -1903,9 +1942,10 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
+            results = _deduplicate_recall_results(resp.results)
+            num_results = len(results)
             logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            text = "\n".join(f"- {r.text}" for r in results)
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
@@ -2245,11 +2285,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
+                results = _deduplicate_recall_results(resp.results)
+                num_results = len(results)
                 logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = [f"{i}. {r.text}" for i, r in enumerate(results, 1)]
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)

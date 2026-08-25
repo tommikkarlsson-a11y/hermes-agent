@@ -80,6 +80,8 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
+Auto-recall and the `hindsight_recall` tool remove exact and conservative near-duplicates after normalizing case, whitespace, and punctuation. The first result in Hindsight's ranking is kept.
+
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
 > Previously recall returned all three fact types. It now returns only observations.

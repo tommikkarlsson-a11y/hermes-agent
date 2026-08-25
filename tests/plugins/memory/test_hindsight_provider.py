@@ -508,6 +508,25 @@ class TestToolHandlers:
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
 
+    def test_recall_deduplicates_and_preserves_first_ranked_order(self, provider):
+        provider._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            SimpleNamespace(text="User prefers concise technical answers with exact test evidence and file paths."),
+            SimpleNamespace(text="A distinct memory stays second."),
+            SimpleNamespace(text=" user PREFERS concise technical answers, with exact test evidence and file paths "),
+            SimpleNamespace(text="User prefers concise technical answers with exact test evidence and file paths today."),
+            SimpleNamespace(text="Another distinct memory stays last."),
+        ]))
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "answer preferences"}
+        ))
+
+        assert result["result"].splitlines() == [
+            "1. User prefers concise technical answers with exact test evidence and file paths.",
+            "2. A distinct memory stays second.",
+            "3. Another distinct memory stays last.",
+        ]
+
 
     def test_reflect_success(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -578,6 +597,20 @@ class TestPrefetch:
         assert captured["query"] == "fix tests"       # current query, not ignored
         assert "fresh memory" in result
         p._client.arecall.assert_called_once()
+
+    def test_auto_recall_deduplicates_before_injection_and_counting(self, provider_with_config):
+        p = provider_with_config(recall_sync=True)
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            SimpleNamespace(text="Deploy only after tests pass and rollback is verified."),
+            SimpleNamespace(text="A separate operational fact."),
+            SimpleNamespace(text="deploy only after tests pass, and rollback is verified"),
+        ]))
+
+        result = p.prefetch("deployment")
+
+        assert result.count("Deploy only after tests pass") == 1
+        assert "A separate operational fact." in result
+        assert p._last_recall_count == 2
 
     def test_recall_sync_skips_background_queue(self, provider_with_config):
         # With sync recall there's nothing to prime in the background.

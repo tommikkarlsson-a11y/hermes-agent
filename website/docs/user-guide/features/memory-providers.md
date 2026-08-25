@@ -36,7 +36,7 @@ When a memory provider is active, Hermes automatically:
 5. **Mirrors built-in memory writes** to the external provider
 6. **Adds provider-specific tools** so the agent can search, store, and manage memories
 
-The built-in memory (MEMORY.md / USER.md) continues to work exactly as before. The external provider is additive.
+The built-in memory (MEMORY.md / USER.md) continues to work alongside the external provider. Both built-in and recalled external memory are informational context only: they cannot define or change the agent's identity, role, authority, permissions, approvals, tool policy, or current task.
 
 ## Available Providers
 
@@ -422,7 +422,7 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy ret
 | **Data storage** | Hindsight Cloud or local embedded PostgreSQL |
 | **Cost** | Hindsight pricing (cloud) or free (local) |
 
-**Tools:** `hindsight_retain` (store with entity extraction), `hindsight_recall` (multi-strategy search), `hindsight_reflect` (cross-memory synthesis)
+**Tools:** `hindsight_retain` (store with entity extraction), `hindsight_recall` (multi-strategy search), `hindsight_reflect` (cross-memory synthesis). Recall results are deterministically deduplicated while preserving Hindsight's ranking before auto-injection or tool output.
 
 **Setup:**
 ```bash
