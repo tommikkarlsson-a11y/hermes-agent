@@ -38,3 +38,37 @@ def test_wrap_command_uses_stable_parent_pid_and_preserves_command_tail():
         *command_args,
     ]
     assert "--create-time" not in wrapped_args
+
+
+@pytest.mark.parametrize(
+    ("tracked_pids", "live_pids", "expected_dead"),
+    [
+        (set(), set(), False),
+        ({101}, {101}, False),
+        ({101, 202}, {202}, False),
+        ({101, 202}, set(), True),
+    ],
+)
+def test_stdio_children_dead_requires_every_tracked_child_to_exit(
+    monkeypatch,
+    tracked_pids,
+    live_pids,
+    expected_dead,
+):
+    task = mcp_tool.MCPServerTask("test-server")
+    task._stdio_child_pids = tracked_pids
+    monkeypatch.setattr(
+        "psutil.pid_exists",
+        lambda pid: pid in live_pids,
+    )
+
+    assert task._stdio_children_dead() is expected_dead
+
+
+def test_stdio_children_dead_is_not_applied_to_http(monkeypatch):
+    task = mcp_tool.MCPServerTask("test-server")
+    task._config = {"url": "https://example.invalid/mcp"}
+    task._stdio_child_pids = {101}
+    monkeypatch.setattr("psutil.pid_exists", lambda _pid: False)
+
+    assert task._stdio_children_dead() is False
