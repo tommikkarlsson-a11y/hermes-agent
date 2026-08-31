@@ -16,6 +16,7 @@ module graph from the updated checkout.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 
@@ -23,6 +24,7 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli import update_receipt
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +82,22 @@ def test_purge_protects_executing_modules():
     assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
     assert sys.modules.get("hermes_cli.main") is cli_main
     assert "hermes_cli" in sys.modules
+
+
+def test_purge_preserves_active_update_receipt(tmp_path, monkeypatch):
+    """The in-flight receipt must survive the post-pull module purge."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    update_receipt._current = None
+    update_receipt.begin_update_receipt()
+    update_receipt.record_step("pre_pull", True)
+
+    cli_main._purge_stale_hermes_modules()
+
+    reimported = importlib.import_module("hermes_cli.update_receipt")
+    assert reimported is update_receipt
+    path = reimported.finalize_update_receipt("success")
+    assert path is not None
+    assert path.is_file()
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
