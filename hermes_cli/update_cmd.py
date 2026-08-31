@@ -5475,6 +5475,55 @@ def _leftover_pausable_gateway_pids(
     return pids
 
 
+def _refuse_gateway_ancestor_tree_kill(
+    pids: list[int], *, gateway_mode: bool
+) -> bool:
+    """Refuse a plain Windows update that would kill its own process tree.
+
+    A chat agent can launch plain ``hermes update`` through its terminal tool.
+    In that topology the updater is a child of the gateway.  The leftover
+    holder recovery below uses ``taskkill /T /F`` on Windows, so force-stopping
+    that gateway also kills the updater before it can mutate the checkout
+    (#98814).
+
+    ``/update`` uses the supported ``--gateway`` hand-off and is deliberately
+    exempt: it detaches the updater and provides file-based progress/result
+    delivery.  For every other invocation, refuse only when a nominated
+    gateway is positively identified as this process's ancestor.  If ancestry
+    cannot be established, preserve the existing holder recovery behavior.
+    """
+    if gateway_mode or not pids:
+        return False
+
+    try:
+        from hermes_cli.gateway import _is_pid_ancestor_of_current_process
+
+        ancestors = [
+            int(pid)
+            for pid in pids
+            if _is_pid_ancestor_of_current_process(int(pid))
+        ]
+    except Exception as exc:
+        logger.debug("Could not inspect gateway ancestry before tree-kill: %s", exc)
+        return False
+
+    if not ancestors:
+        return False
+
+    rendered = ", ".join(str(pid) for pid in ancestors)
+    print(
+        "✗ Refusing to stop the gateway process tree because this updater "
+        f"is running inside it (gateway PID(s): {rendered})."
+    )
+    print(
+        "  On Windows, taskkill /T would terminate the updater before the "
+        "update can run."
+    )
+    print("  From a chat platform, use `/update` instead.")
+    print("  Otherwise, run `hermes update` from a separate terminal.")
+    return True
+
+
 def _ledger_manual_serve_holders(
     matches: list[tuple[int, str, str]],
 ) -> list[dict]:
@@ -5584,7 +5633,7 @@ def _relaunch_stopped_serves(token: dict) -> None:
 
 def _orphaned_desktop_backend_pids(
     matches: list[tuple[int, str, str]],
-) -> list[int] | None:
+) -> list[tuple[int, int]] | None:
     """PIDs from *matches* when every remaining holder is an ORPHANED backend.
 
     The venv-holder guard refuses on the Desktop app's ``serve`` backend by
@@ -5632,7 +5681,7 @@ def _orphaned_desktop_backend_pids(
         )
 
     # Pass 1: find orphaned backend ROOTS among the holders.
-    roots: list[int] = []
+    roots: list[tuple[int, int]] = []
     remaining: list[tuple[int, str]] = []  # (pid, argv_low) still to justify
     for pid, _name, cmdline in matches:
         argv = cmdline
@@ -5650,6 +5699,21 @@ def _orphaned_desktop_backend_pids(
             continue
         try:
             proc = psutil.Process(int(pid))
+            # Fingerprint from the SAME psutil handle used for classification
+            # below, quantized to centiseconds — the exact scheme
+            # gateway.status.get_process_start_time uses on Windows, so the
+            # value round-trips through pid_is_hermes at kill time. (Reading
+            # /proc/<pid>/stat here instead would consult the HOST process
+            # table and use different units.)
+            process_start_time = int(round(proc.create_time() * 100))
+        except psutil.NoSuchProcess:
+            # The candidate itself exited during classification; there is
+            # nothing left to reap and no identity to pass to taskkill.
+            continue
+        except Exception:
+            return None
+
+        try:
             ppid = proc.ppid()
             parent = psutil.Process(ppid) if ppid else None
             if parent is not None and parent.is_running():
@@ -5668,12 +5732,12 @@ def _orphaned_desktop_backend_pids(
             pass  # parent gone → orphan
         except Exception:
             return None
-        roots.append(int(pid))
+        roots.append((int(pid), process_start_time))
 
     # Pass 2: every non-backend holder must be a descendant of an accepted
     # orphan root — then it dies with the root's tree reap. Anything else
     # (operator REPL, stray script) keeps the refusal.
-    root_set = set(roots)
+    root_set = {pid for pid, _start_time in roots}
     for pid, _low in remaining:
         if not root_set:
             return None
@@ -5803,7 +5867,9 @@ def _handoff_reapable_backend_pids(
     return roots or None
 
 
-def _stop_process_trees(pids: list[int]) -> None:
+def _stop_process_trees(
+    pids: list[int] | list[tuple[int, int]],
+) -> None:
     """Force-stop each PID with its full child tree (Windows).
 
     ``taskkill /T /F`` mirrors the Desktop's ``forceKillProcessTree`` and
@@ -5811,12 +5877,38 @@ def _stop_process_trees(pids: list[int]) -> None:
     ``.hermes-runtime`` interpreter child alive and holding the install open
     (#70026). Best effort; never raises.
     """
-    for pid in pids:
+    from gateway.status import get_process_start_time
+    from hermes_cli._subprocess_compat import pid_is_hermes, windows_hide_flags
+
+    for entry in pids:
+        if isinstance(entry, tuple):
+            pid, expected_start_time = entry
+        else:
+            pid = int(entry)
+            expected_start_time = get_process_start_time(pid)
         try:
+            if expected_start_time is None:
+                logger.debug(
+                    "Skipping taskkill of PID %s: process identity unavailable",
+                    pid,
+                )
+                continue
+            if not pid_is_hermes(
+                pid,
+                expected_start_time=expected_start_time,
+            ):
+                logger.debug(
+                    "Skipping taskkill of non-Hermes or changed PID %s",
+                    pid,
+                )
+                continue
             subprocess.run(
-                ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
                 check=False,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
         except Exception as exc:
             logger.debug("Could not stop process tree %s: %s", pid, exc)
@@ -6073,7 +6165,7 @@ def _pause_windows_gateways_for_update() -> dict | None:
         return None
 
     try:
-        from gateway.status import terminate_pid
+        from gateway.status import get_process_start_time, terminate_pid
         from hermes_cli.gateway import (
             _capture_gateway_argv,
             _get_restart_drain_timeout,
@@ -6263,8 +6355,13 @@ def _pause_windows_gateways_for_update() -> dict | None:
     force_killed = []
     for pid in sorted(set(survivors).union(unmapped_pids).union(launcher_pids)):
         try:
-            terminate_pid(int(pid), force=True)
-            force_killed.append(int(pid))
+            pid_int = int(pid)
+            terminate_pid(
+                pid_int,
+                force=True,
+                expected_start_time=get_process_start_time(pid_int),
+            )
+            force_killed.append(pid_int)
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -7757,13 +7854,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if _venv_holders:
             _gateway_holders = _m()._leftover_pausable_gateway_pids(_venv_holders)
             if _gateway_holders is not None:
+                if _refuse_gateway_ancestor_tree_kill(
+                    _gateway_holders, gateway_mode=gateway_mode
+                ):
+                    _m()._resume_windows_gateways_after_update(
+                        _windows_gateway_resume
+                    )
+                    sys.exit(2)
                 # Every remaining holder is a gateway the pause machinery
                 # already owns — respawned by its supervisor inside the
                 # pause→guard window, or up through a spawn path discovery
                 # does not map. Stop them and re-check instead of
                 # dead-ending; the post-update resume (and the supervisor
                 # that respawned them) brings gateways back afterwards.
-                from gateway.status import terminate_pid
+                from gateway.status import get_process_start_time, terminate_pid
 
                 print(
                     f"  ⚠ {len(_gateway_holders)} gateway process(es) still "
@@ -7771,7 +7875,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 for _pid in _gateway_holders:
                     try:
-                        terminate_pid(int(_pid), force=True)
+                        pid_int = int(_pid)
+                        terminate_pid(
+                            pid_int,
+                            force=True,
+                            expected_start_time=get_process_start_time(pid_int),
+                        )
                     except Exception as exc:
                         logger.debug(
                             "Could not stop leftover gateway %s: %s", _pid, exc
@@ -9981,14 +10090,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(
                         f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing"
                     )
-                    from gateway.status import terminate_pid as _terminate_pid
+                    from gateway.status import (
+                        get_process_start_time as _get_process_start_time,
+                        terminate_pid as _terminate_pid,
+                    )
                     for pid in _stuck:
                         try:
                             # Routes through taskkill /T /F on Windows,
                             # SIGKILL on POSIX — _signal.SIGKILL doesn't
                             # exist on Windows so the old raw os.kill call
                             # used to crash the entire update path.
-                            _terminate_pid(pid, force=True)
+                            _terminate_pid(
+                                pid,
+                                force=True,
+                                expected_start_time=_get_process_start_time(pid),
+                            )
                         except (ProcessLookupError, PermissionError, OSError):
                             pass
                     # Give the OS a beat to reap the processes so the

@@ -656,6 +656,9 @@ def _escalate_wedged_gateway(
 
     Returns True once the PID has left the process table.
     """
+    from gateway.status import get_process_start_time
+
+    expected_start_time = get_process_start_time(pid)
     try:
         terminate_pid(pid, force=False)
     except (ProcessLookupError, PermissionError, OSError):
@@ -663,7 +666,7 @@ def _escalate_wedged_gateway(
     if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
         return True
     try:
-        terminate_pid(pid, force=True)
+        terminate_pid(pid, force=True, expected_start_time=expected_start_time)
         print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
     except (ProcessLookupError, PermissionError, OSError):
         pass
@@ -2148,7 +2151,20 @@ def kill_gateway_processes(
 
     for pid in pids:
         try:
-            terminate_pid(pid, force=force)
+            expected_start_time = None
+            if force:
+                # Re-verify at kill time, not just scan time: the cmdline
+                # match inside find_gateway_pids() is stale by the time we
+                # get here, and a recycled PID could otherwise be tree-killed
+                # (#89614 class). _capture_gateway_argv re-reads the LIVE
+                # cmdline and returns None for anything that no longer looks
+                # like a gateway — refuse those.
+                if _capture_gateway_argv(pid) is None:
+                    continue
+                from gateway.status import get_process_start_time
+
+                expected_start_time = get_process_start_time(pid)
+            terminate_pid(pid, force=force, expected_start_time=expected_start_time)
             killed += 1
         except ProcessLookupError:
             # Process already gone
@@ -2347,6 +2363,20 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     if not orphans:
         return False
 
+    # Pin each orphan's identity NOW: the cmdline scan above matched at
+    # scan-time only, and the SIGKILL escalation below fires seconds later.
+    # A PID recycled inside that window must never be force-killed (#89614
+    # class). Fingerprint capture is best-effort — SIGTERM below proceeds
+    # regardless (it targets the process verified by the scan an instant
+    # ago), but the delayed SIGKILL requires a still-matching fingerprint.
+    from gateway.status import get_process_start_time
+
+    orphan_identity: dict[int, int] = {}
+    for pid in orphans:
+        start = get_process_start_time(pid)
+        if start is not None:
+            orphan_identity[pid] = start
+
     reaped = False
     for pid in orphans:
         try:
@@ -2366,7 +2396,16 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     # running until a follow-up SIGKILL — wait, then force-kill any survivor
     # so the replacement can bind the port cleanly.
     survivors = _await_gateway_exit(orphans, pid_exists=_pid_exists)
-    _force_kill_survivors(survivors)
+    # Re-verify identity at kill time: the delayed SIGKILL only fires when
+    # the PID still names the process fingerprinted at scan time (fail-closed
+    # taskkill class fix — a recycled PID must never be force-killed).
+    verified_survivors = []
+    for pid in survivors:
+        recorded = orphan_identity.get(pid)
+        if recorded is None or get_process_start_time(pid) != recorded:
+            continue
+        verified_survivors.append(pid)
+    _force_kill_survivors(verified_survivors)
 
     return reaped
 
@@ -5776,7 +5815,7 @@ def _wait_for_gateway_exit(
         force_after: Seconds of graceful waiting before escalating to force-kill.
     """
     import time
-    from gateway.status import get_running_pid
+    from gateway.status import get_process_start_time, get_running_pid
 
     deadline = time.monotonic() + timeout
     force_deadline = (
@@ -5796,7 +5835,11 @@ def _wait_for_gateway_exit(
         ):
             # Grace period expired — force-kill the specific PID.
             try:
-                terminate_pid(pid, force=True)
+                terminate_pid(
+                    pid,
+                    force=True,
+                    expected_start_time=get_process_start_time(pid),
+                )
                 print(f"⚠ Gateway PID {pid} did not exit gracefully; sent SIGKILL")
             except (ProcessLookupError, PermissionError, OSError):
                 return True  # Already gone or we can't touch it.
