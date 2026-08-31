@@ -24,6 +24,7 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli import update_inventory
 from hermes_cli import update_receipt
 
 
@@ -98,6 +99,42 @@ def test_purge_preserves_active_update_receipt(tmp_path, monkeypatch):
     path = reimported.finalize_update_receipt("success")
     assert path is not None
     assert path.is_file()
+
+
+def test_purge_preserves_update_inventory_type_identity():
+    """Pre-update plan rows must reconcile after the post-pull purge."""
+    plan = update_inventory.UpdatePlan(
+        runtimes=[
+            update_inventory.RuntimeRecord(
+                kind="gateway",
+                profile="personal",
+                pid=123,
+                restart_via="launchd",
+            )
+        ]
+    )
+
+    cli_main._purge_stale_hermes_modules()
+
+    reimported = importlib.import_module("hermes_cli.update_inventory")
+    assert reimported is update_inventory
+    outcomes = reimported.match_runtime_outcomes(
+        plan,
+        restarted_services=["hermes-gateway-personal"],
+        relaunched_profiles=[],
+        externally_supervised_profiles=[],
+        killed_pids=set(),
+        failed_units=[],
+    )
+    assert outcomes == [
+        {
+            "kind": "gateway",
+            "profile": "personal",
+            "pid": 123,
+            "mechanism": "launchd",
+            "outcome": "restarted",
+        }
+    ]
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
