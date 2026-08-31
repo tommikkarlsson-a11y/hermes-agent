@@ -4073,6 +4073,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_SUPERVISED_CHILD=1"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -4111,6 +4112,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+Environment="HERMES_SUPERVISED_CHILD=1"
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -5397,6 +5399,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>HERMES_SUPERVISED_CHILD</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -6363,6 +6367,24 @@ def _guard_existing_gateway_process_conflict(replace: bool = False) -> None:
         logger.debug("Existing-gateway process probe failed", exc_info=True)
         return
     if pid is None:
+        # get_running_pid() now filters records by the current profile's
+        # HERMES_HOME (via _pid_record_belongs_to_current_profile). When no
+        # match was found, check whether a stale PID file from a different
+        # profile exists — the user may have switched profiles while the old
+        # gateway is still running.
+        try:
+            from gateway.status import _read_pid_record, _pid_record_belongs_to_current_profile
+
+            stale = _read_pid_record()
+            if stale is not None and not _pid_record_belongs_to_current_profile(stale):
+                stale_home = stale.get("hermes_home", "<unknown>")
+                logger.warning(
+                    "PID file belongs to another profile (hermes_home=%s). "
+                    "The old gateway may still be running under that profile.",
+                    stale_home,
+                )
+        except Exception:
+            pass
         return
 
     print_error(
@@ -6418,6 +6440,63 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
+
+    # Startup-liveness watchdog (OOF-298), idempotent backstop: normal
+    # ``hermes gateway run`` invocations already armed in hermes_cli.main's
+    # argv fast-path (before the heavy import graph), but programmatic
+    # callers can enter run_gateway() directly. Placed after the
+    # process-conflict guards: a --replace loser exiting above must not have
+    # armed a watchdog first. Disarmed by GatewayRunner once the event loop
+    # is confirmed live.
+    #
+    # config.yaml is the user-facing surface (gateway.startup_watchdog /
+    # gateway.startup_watchdog_timeout_seconds); the env vars are the
+    # internal bridge, needed because the argv fast-path arms before config
+    # can load. Explicit env values (operator override) are respected.
+    #
+    # The argv fast-path has ALREADY armed on the standard `hermes gateway
+    # run` path by the time this runs, and arm_startup_watchdog() is
+    # idempotent (returns the live handle without re-reading env). So the
+    # bridge alone is not enough: apply the config to the live handle —
+    # disarm when disabled, disarm+re-arm when a config timeout should
+    # replace the fast-path default. Re-arming is safe here: the heavy
+    # import graph the fast-path guards is behind us, and the fresh handle
+    # covers the remaining pre-loop startup with the configured deadline.
+    try:
+        from hermes_startup_watchdog import (
+            ENV_STARTUP_WATCHDOG,
+            ENV_STARTUP_WATCHDOG_TIMEOUT_S,
+            arm_startup_watchdog,
+            disarm_startup_watchdog,
+            startup_watchdog_disabled,
+        )
+        _sw_timeout_bridged = False
+        try:
+            from hermes_cli.config import load_config as _sw_load_config
+            _gw_cfg = (_sw_load_config() or {}).get("gateway", {}) or {}
+            if ENV_STARTUP_WATCHDOG not in os.environ and not _gw_cfg.get(
+                "startup_watchdog", True
+            ):
+                os.environ[ENV_STARTUP_WATCHDOG] = "0"
+            _sw_timeout = _gw_cfg.get("startup_watchdog_timeout_seconds")
+            if (
+                ENV_STARTUP_WATCHDOG_TIMEOUT_S not in os.environ
+                and _sw_timeout is not None
+            ):
+                os.environ[ENV_STARTUP_WATCHDOG_TIMEOUT_S] = str(_sw_timeout)
+                _sw_timeout_bridged = True
+        except Exception:
+            pass
+        if startup_watchdog_disabled():
+            disarm_startup_watchdog()
+        else:
+            if _sw_timeout_bridged:
+                # A config timeout must beat the fast-path default that an
+                # already-armed handle resolved before config was readable.
+                disarm_startup_watchdog()
+            arm_startup_watchdog()
+    except Exception:
+        pass
 
     # Detached Windows gateway runs must ignore console-control broadcasts
     # from sibling CLI processes, but foreground `hermes gateway run` still
@@ -6601,6 +6680,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
                 _storm.window_s,
                 _storm.backoff_s,
             )
+            # The backoff sleep is intentional idle time — tell the startup
+            # watchdog (OOF-298) so it isn't mistaken for a parked deadlock
+            # and hard-exited mid-backoff (which would defeat the breaker).
+            try:
+                from gateway.startup_watchdog import kick_startup_watchdog
+
+                kick_startup_watchdog(extra_s=_storm.backoff_s)
+            except Exception:
+                pass
             _time.sleep(_storm.backoff_s)
     except Exception as _be:
         logger.debug("respawn-storm breaker check failed (non-fatal): %s", _be)

@@ -151,19 +151,24 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
     "no api key found",
 )
 
-_HYGIENE_IDLE_TIMEOUT_MARKERS: tuple[str, ...] = (
+_HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS: tuple[str, ...] = (
     "session hygiene compression timed out",
+    "hygiene compression deferred: turn-hold budget expired",
 )
 
 
-def _is_hygiene_idle_timeout_error(error: object) -> bool:
-    """Return True when the durable cooldown came from a hygiene watchdog timeout.
+def _is_hygiene_preagent_only_cooldown(error: object) -> bool:
+    """Return True for a cooldown that belongs only to pre-agent hygiene.
 
-    That persist is intentional for the pre-agent hygiene pass (#74136) but
-    must not block the in-conversation compressor (#86972).
+    Hygiene watchdog timeouts and turn-hold deferrals intentionally persist
+    retry spacing for the pre-agent pass (#74136), but neither is evidence of
+    an auxiliary-model failure and neither may block the in-agent compressor
+    (#86972).
     """
     text = str(error or "").strip().casefold()
-    return any(marker in text for marker in _HYGIENE_IDLE_TIMEOUT_MARKERS)
+    return any(
+        marker in text for marker in _HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS
+    )
 
 
 def _response_finish_reason(response: Any) -> str:
@@ -2974,11 +2979,11 @@ class ContextCompressor(ContextEngine):
                 self._last_summary_error = None
             return None
 
-        # Hygiene idle-watchdog timeouts persist the same column so the
-        # pre-agent pass can skip (#74136), but they are not evidence of a
-        # 429/aux-model fault. The in-conversation compressor has its own
-        # budget and must still be allowed to run (#86972).
-        if _is_hygiene_idle_timeout_error(state.get("error")):
+        # Hygiene watchdog timeouts and turn-hold deferrals persist the same
+        # column so the pre-agent pass can skip (#74136), but they are not
+        # evidence of a 429/aux-model fault. The in-conversation compressor has
+        # its own budget and must still be allowed to run (#86972).
+        if _is_hygiene_preagent_only_cooldown(state.get("error")):
             # A later hygiene write can overwrite a previous aux-model row
             # on the shared column. Drop any in-memory cooldown so the
             # in-agent compressor is not still blocked after this refresh.
@@ -3315,10 +3320,20 @@ class ContextCompressor(ContextEngine):
         equal the ENTIRE window — auto-compression can never fire because the
         provider rejects the request before usage reaches 100% (#14690).
 
-        When the floor would meet or exceed the context window, trigger at
-        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the window — high enough that a
-        small model uses most of its context before compacting, but below
-        100% so compaction fires before the provider rejects the request.
+        Near-minimum windows degenerate the same way without ever tripping an
+        equality check: at ``context_length == 65536`` the floored threshold
+        used to pass through at 64,000 — 97.7% of the window, ~1.5K tokens of
+        output room. Providers that silently truncate over-window prompts
+        instead of rejecting them (e.g. ollama's OpenAI-compatible endpoint)
+        never deliver the reactive context-overflow backstop either, so a
+        session rides into the window ceiling and every length-continuation
+        retry re-sends a window-filling prompt for a shrinking sliver of
+        output. Whenever the floor is the binding term, it is therefore capped
+        at ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the effective input budget —
+        high enough that a small model uses most of its context before
+        compacting, but low enough that compaction fires while output room
+        remains. An explicit ``threshold_percent`` above 85% is user intent,
+        not the floor, and is not capped.
 
         The provider reserves ``max_tokens`` of output space out of the same
         window, so the usable INPUT budget is ``context_length - max_tokens``.
@@ -3334,13 +3349,17 @@ class ContextCompressor(ContextEngine):
             effective_window = context_length
         pct_value = int(effective_window * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
-        # never be reached. Trigger at 85% of the effective input budget so a
-        # minimum-context model rides most of its budget before compacting
-        # instead of wasting half.
+        # The floor must not consume the window's output headroom: cap it at
+        # 85% of the effective input budget whenever it is the binding term.
+        # (An explicit threshold_percent above 85% is user intent — kept.)
+        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
+        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
+        # If the percentage itself reaches the effective window it can never
+        # be reached — trigger at 85% of the window, below 100% so compaction
+        # fires before the provider rejects (or silently clips) the request.
         if effective_window > 0 and floored >= effective_window:
-            return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
-                              effective_window - 1))
+            return max(1, min(trigger_cap, effective_window - 1))
         return floored
     def __init__(
         self,
