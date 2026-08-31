@@ -1154,7 +1154,7 @@ def _reload_process_scan_modules() -> None:
 
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
-) -> None:
+) -> dict[str, list]:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
     *already_restarted_units* forwards the systemd unit names (no
@@ -1166,7 +1166,7 @@ def _finish_dashboard_update_cleanup(
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
-        return
+        return {"matched": [], "killed": [], "failed": [], "unrecovered": []}
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
     # both modules reflect the freshly-updated source before touching them.
@@ -1175,16 +1175,16 @@ def _finish_dashboard_update_cleanup(
     stop_result = _m()._kill_stale_dashboard_processes(
         restart_managed=True, already_restarted_units=already_restarted_units
     )
-    if not stop_result.get("unrecovered"):
-        return
+    if stop_result.get("unrecovered"):
+        print()
+        print(
+            "⚠ A web dashboard/serve process was stopped during update and could "
+            "not be auto-restarted."
+        )
+        print("  Re-launch it when you want the web UI back:")
+        print("    hermes dashboard --port <port>")
+    return stop_result
 
-    print()
-    print(
-        "⚠ A web dashboard/serve process was stopped during update and could "
-        "not be auto-restarted."
-    )
-    print("  Re-launch it when you want the web UI back:")
-    print("    hermes dashboard --port <port>")
 
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
@@ -10199,8 +10199,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
+        _dashboard_cleanup = _finish_dashboard_update_cleanup(
             node_failures, already_restarted_units=set(restarted_services)
+        ) or {}
+        _dashboard_restarted_pids = set(_dashboard_cleanup.get("killed") or [])
+        _dashboard_restarted_pids.difference_update(
+            _dashboard_cleanup.get("unrecovered") or []
         )
 
         print()
@@ -10312,6 +10316,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     externally_supervised_profiles=externally_supervised_profiles,
                     killed_pids=killed_pids,
                     failed_units=failed_or_stale_units,
+                    restarted_runtime_pids=_dashboard_restarted_pids,
                 )
                 if report_unaccounted_runtimes(_runtime_outcomes):
                     gateway_fleet_restart_incomplete = True

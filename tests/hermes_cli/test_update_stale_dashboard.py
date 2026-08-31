@@ -862,11 +862,14 @@ class TestPostUpdateStaleModuleReload:
             side_effect=lambda: order.append("reload"),
         ), patch(
             "hermes_cli.main._kill_stale_dashboard_processes",
-            side_effect=lambda **kw: order.append("kill") or {"unrecovered": []},
+            side_effect=lambda **kw: order.append("kill") or {
+                "matched": [41], "killed": [41], "failed": [], "unrecovered": [],
+            },
         ):
-            update_cmd._finish_dashboard_update_cleanup([])
+            result = update_cmd._finish_dashboard_update_cleanup([])
 
         assert order == ["reload", "kill"]
+        assert result["killed"] == [41]
 
     def test_node_failures_skip_reload_and_kill(self):
         """A failed Node refresh leaves the running dashboard untouched —
@@ -875,10 +878,11 @@ class TestPostUpdateStaleModuleReload:
 
         with patch.object(update_cmd, "_reload_process_scan_modules") as mock_reload, \
              patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill:
-            update_cmd._finish_dashboard_update_cleanup(["dashboard"])
+            result = update_cmd._finish_dashboard_update_cleanup(["dashboard"])
 
         mock_reload.assert_not_called()
         mock_kill.assert_not_called()
+        assert result["killed"] == []
 
     def test_reload_restores_missing_symbol(self):
         """Simulate the stale-module state: strip ``bounded_probe_run`` off

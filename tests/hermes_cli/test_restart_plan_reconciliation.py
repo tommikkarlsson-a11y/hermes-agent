@@ -159,6 +159,39 @@ def test_external_supervisor_counts_as_restarted():
     assert outcomes[0]["outcome"] == "restarted"
 
 
+def test_dashboard_cleanup_pid_counts_as_restarted():
+    runtime = RuntimeRecord(
+        kind="dashboard",
+        profile="default",
+        pid=650,
+        supervisor="manual-serve",
+        restart_via="respawn-argv",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(runtime),
+        restarted_services=[], relaunched_profiles=[],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+        restarted_runtime_pids={650},
+    )
+    assert outcomes[0]["outcome"] == "restarted"
+
+
+def test_gateway_profile_restart_does_not_cover_dashboard():
+    runtime = RuntimeRecord(
+        kind="serve",
+        profile="default",
+        pid=651,
+        supervisor="desktop",
+        restart_via="desktop",
+    )
+    outcomes = match_runtime_outcomes(
+        _plan(runtime),
+        restarted_services=[], relaunched_profiles=["default"],
+        externally_supervised_profiles=[], killed_pids=set(), failed_units=[],
+    )
+    assert outcomes[0]["outcome"] == "unaccounted"
+
+
 def test_mixed_fleet_only_the_missed_one_escalates(capsys):
     outcomes = match_runtime_outcomes(
         _plan(

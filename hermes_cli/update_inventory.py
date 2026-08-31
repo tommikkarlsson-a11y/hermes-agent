@@ -428,6 +428,7 @@ def match_runtime_outcomes(
     externally_supervised_profiles: list,
     killed_pids: set,
     failed_units: list,
+    restarted_runtime_pids: set | None = None,
 ) -> list[dict[str, Any]]:
     """Reconcile the plan's runtimes against what the restart phase DID.
 
@@ -439,12 +440,13 @@ def match_runtime_outcomes(
 
         {"kind", "profile", "pid", "mechanism", "outcome"}
 
-    outcome: ``restarted`` (service restarted / profile relaunched /
-    handed to external supervisor), ``stopped`` (pid killed, watcher or
-    operator relaunches), ``failed`` (in the phase's failed/stale list) or
-    ``unaccounted`` — the plan saw it and NO bookkeeping mentions it: the
-    blind-spot tripwire (same philosophy as the fleet matrix's DOWN row).
-    Never raises; on any probe error returns what it has.
+    outcome: ``restarted`` (service restarted / profile relaunched / handed
+    to an external supervisor / exact dashboard cleanup PID recovered),
+    ``stopped`` (pid killed, watcher or operator relaunches), ``failed`` (in
+    the phase's failed/stale list) or ``unaccounted`` — the plan saw it and
+    NO bookkeeping mentions it: the blind-spot tripwire (same philosophy as
+    the fleet matrix's DOWN row). Never raises; on any probe error returns
+    what it has.
     """
     outcomes: list[dict[str, Any]] = []
     try:
@@ -453,22 +455,27 @@ def match_runtime_outcomes(
         relaunched = set(relaunched_profiles or [])
         external = set(externally_supervised_profiles or [])
         killed = {int(p) for p in (killed_pids or set())}
+        restarted_pids = {int(p) for p in (restarted_runtime_pids or set())}
 
         for runtime in plan.runtimes:
             r = runtime if isinstance(runtime, RuntimeRecord) else None
             if r is None:
                 continue
             outcome = "unaccounted"
-            if r.profile in relaunched or r.profile in external:
+            if r.pid is not None and r.pid in restarted_pids:
+                outcome = "restarted"
+            elif r.kind == "gateway" and (
+                r.profile in relaunched or r.profile in external
+            ):
                 outcome = "restarted"
             elif r.pid is not None and r.pid in killed:
                 outcome = "stopped"
-            elif any(
+            elif r.kind == "gateway" and any(
                 r.profile in unit or (r.profile == "default" and "hermes-gateway" in unit)
                 for unit in failed_set
             ):
                 outcome = "failed"
-            elif any(
+            elif r.kind == "gateway" and any(
                 r.profile in svc or (r.profile == "default" and "hermes-gateway" in svc)
                 for svc in restarted_set
             ):
