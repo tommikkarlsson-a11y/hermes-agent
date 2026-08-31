@@ -2634,6 +2634,7 @@ def _compute_host_turn_frame(
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
+        "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -3220,7 +3221,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw = {
+                    "session_db": session_db,
+                    "context_cwd_is_launch_artifact": (
+                        _context_cwd_is_launch_artifact(current)
+                    ),
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3566,6 +3572,15 @@ def _session_cwd(session: dict | None) -> str:
 # a workspace the user picked. Everything else is terminal-started: the process
 # runs in a directory the user deliberately cd'd into.
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
+
+
+def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
+    """Whether the session cwd came from app launch rather than user intent."""
+    return bool(
+        session
+        and not session.get("explicit_cwd")
+        and _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE
+    )
 
 
 def _persisted_session_cwd(session: dict) -> str | None:
@@ -8662,6 +8677,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_cwd_is_launch_artifact=(
+                _context_cwd_is_launch_artifact(session)
+            ),
         )
     finally:
         _clear_session_context(tokens)
@@ -8832,6 +8850,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_cwd_is_launch_artifact: bool | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -8961,7 +8980,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -9008,6 +9027,16 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if context_cwd_is_launch_artifact is None:
+        with _sessions_lock:
+            context_session = _sessions.get(sid)
+        context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(
+            context_session
+        )
+    agent._context_cwd_is_launch_artifact = bool(
+        context_cwd_is_launch_artifact
+    )
+    return agent
 
 
 def _init_session(
@@ -9020,6 +9049,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    explicit_cwd: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -9036,6 +9066,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": bool(explicit_cwd),
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -10441,6 +10472,7 @@ def _deferred_session_record(
     model_override=None,
     resume_runtime_overrides: dict | None = None,
     todo_state: dict | None = None,
+    explicit_cwd: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10457,7 +10489,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": bool(explicit_cwd),
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
