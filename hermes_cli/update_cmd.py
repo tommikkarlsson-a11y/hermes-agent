@@ -10349,6 +10349,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 restarted_services,
                 killed_pids,
             )
+            _expected_fleet_profiles = _planned_gateway_profiles(_pre_update_plan)
             # A brief settle window: freshly restarted/resumed gateways need
             # a moment to rewrite gateway_state.json with their new identity.
             # Skipped when the restart phase touched nothing (no gateways
@@ -10380,8 +10381,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # resumed gateway has published (no "down" rows remain)
                     # or the deadline passes, so a slow second gateway can't
                     # be misread as down and re-trigger the retry loop.
-                    if _fleet_snapshot and not any(
-                        row.get("state") == "down" for row in _fleet_snapshot
+                    _seen_fleet_profiles = {
+                        str(row.get("profile"))
+                        for row in _fleet_snapshot
+                        if row.get("profile")
+                    }
+                    if (
+                        _fleet_snapshot
+                        and not any(
+                            row.get("state") == "down" for row in _fleet_snapshot
+                        )
+                        and _expected_fleet_profiles <= _seen_fleet_profiles
                     ):
                         break
                     if _time.monotonic() >= _fleet_deadline:
@@ -10390,7 +10400,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _fleet_snapshot = collect_fleet_versions(
                     pre_restart_pids=_pre_restart_gateway_pids
                 )
+            _seen_fleet_profiles = {
+                str(row.get("profile"))
+                for row in _fleet_snapshot
+                if row.get("profile")
+            }
+            _missing_fleet_profiles = (
+                _expected_fleet_profiles - _seen_fleet_profiles
+            )
             if print_fleet_version_matrix(_fleet_snapshot):
+                gateway_fleet_restart_incomplete = True
+            elif _missing_fleet_profiles:
+                print(
+                    "\n⚠ Fleet version check missed planned gateway profile(s): "
+                    + ", ".join(sorted(_missing_fleet_profiles))
+                )
                 gateway_fleet_restart_incomplete = True
             elif not _fleet_snapshot and _fleet_rows_expected:
                 # Fleet probe returned zero rows even though at least one
@@ -10551,7 +10575,7 @@ def _fleet_probe_expected_runtimes(
     * ``pre_restart_pids`` non-empty, or ``None`` (pre-state unreadable —
       cannot prove nothing was running; same contract as
       ``_restart_phase_failure_is_incomplete``, #78574).
-    * the pre-update plan inventoried ≥1 runtime.
+    * the pre-update plan inventoried ≥1 gateway runtime.
 
     ``windows_resume_token`` is deliberately EXCLUDED (#93406 residual). The
     pause/resume token is bookkeeping for ``_pause_windows_gateways_for_update``
@@ -10586,12 +10610,20 @@ def _fleet_probe_expected_runtimes(
         return True
     if pre_restart_pids is None or pre_restart_pids:
         return True
+    return bool(_planned_gateway_profiles(pre_update_plan))
+
+
+def _planned_gateway_profiles(pre_update_plan) -> set[str]:
+    """Profiles whose pre-update gateways must appear in the fleet proof."""
     try:
-        if pre_update_plan is not None and pre_update_plan.runtimes:
-            return True
+        return {
+            str(runtime.profile)
+            for runtime in pre_update_plan.runtimes
+            if getattr(runtime, "kind", None) == "gateway"
+            and getattr(runtime, "profile", None)
+        }
     except Exception:
-        pass
-    return False
+        return set()
 
 
 def _print_items(items, label, key, fallback_key=None):

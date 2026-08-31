@@ -25,6 +25,7 @@ import inspect
 import types
 
 from hermes_cli.main import _fleet_probe_expected_runtimes
+from hermes_cli.update_cmd import _planned_gateway_profiles
 
 
 def _plan(runtimes):
@@ -40,7 +41,7 @@ class TestEmptySnapshotFailClosed:
         # externally-supervised gateway). Zero rows must fail closed.
         assert (
             _fleet_probe_expected_runtimes(
-                _plan([object()]),
+                _plan([types.SimpleNamespace(kind="gateway", profile="work")]),
                 [],  # pre_restart_pids: probe saw nothing
                 None,  # no Windows resume token
                 [],  # restarted_services
@@ -48,6 +49,18 @@ class TestEmptySnapshotFailClosed:
             )
             is True
         )
+
+    def test_non_gateway_plan_does_not_demand_gateway_rows(self):
+        plan = _plan([types.SimpleNamespace(kind="serve", profile="default")])
+        assert _fleet_probe_expected_runtimes(plan, [], None, [], set()) is False
+
+    def test_planned_gateway_profiles_are_exact(self):
+        plan = _plan([
+            types.SimpleNamespace(kind="gateway", profile="personal"),
+            types.SimpleNamespace(kind="gateway", profile="ops"),
+            types.SimpleNamespace(kind="serve", profile="default"),
+        ])
+        assert _planned_gateway_profiles(plan) == {"personal", "ops"}
 
     def test_windows_resume_token_alone_is_not_expected(self):
         # (c) The Windows pause/resume token is EXCLUDED from the expectation
@@ -147,3 +160,8 @@ class TestCallSiteWiring:
             "elif not _fleet_snapshot and (restarted_services or killed_pids):"
             not in src
         )
+
+    def test_nonempty_snapshot_must_cover_planned_profiles(self):
+        src = self._impl_source()
+        assert "_expected_fleet_profiles <= _seen_fleet_profiles" in src
+        assert "elif _missing_fleet_profiles:" in src
