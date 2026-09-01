@@ -81,6 +81,24 @@ def test_notify_sub_delivery_mode_persists_and_last_write_wins(kanban_home):
         conn.close()
 
 
+def test_notify_sub_composes_atomically_inside_graph_transaction(kanban_home):
+    conn = kb.connect()
+    try:
+        with pytest.raises(RuntimeError, match="abort graph"):
+            with kb.write_txn(conn):
+                tid = kb.create_task(conn, title="sealed root", assignee="personal")
+                kb.add_notify_sub(
+                    conn, task_id=tid, platform="slack", chat_id="C123",
+                    delivery_mode="wake",
+                )
+                assert len(kb.list_notify_subs(conn, tid)) == 1
+                raise RuntimeError("abort graph")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_child_task_inherits_parent_delivery_mode(kanban_home):
     """Graph children inherit the parent's ACK edge AND its delivery_mode."""
     import hermes_cli.kanban_db as kb
