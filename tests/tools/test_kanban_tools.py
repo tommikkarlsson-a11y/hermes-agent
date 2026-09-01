@@ -871,6 +871,58 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["delivery_mode"] == "notify+wake"
 
 
+def test_create_encodes_notify_event_kinds_for_auto_subscription(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-filtered")
+    out = kt._handle_create({
+        "title": "filtered subscription",
+        "assignee": "peer",
+        "notify_event_kinds": ["archived", "blocked"],
+    })
+    data = json.loads(out)
+
+    assert data["ok"] is True
+    assert data["subscribed"] is True
+    sub = _sub_index(_list_subs_for_task(data["task_id"]))[0]
+    assert sub["delivery_metadata"]["kanban_event_kinds"] == "blocked,archived"
+    assert kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["notify_event_kinds"] == {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Optional terminal event kinds accepted by this task's inherited "
+            "and originating notification subscriptions. Omission preserves "
+            "the existing full notifier behavior."
+        ),
+    }
+
+
+def test_create_rejects_bad_notify_event_kinds_before_task_insert(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_create({
+        "title": "must not exist",
+        "assignee": "peer",
+        "notify_event_kinds": ["blocked", " BLOCKED "],
+    }))
+    assert "error" in out
+
+    conn = kb.connect()
+    try:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+    assert after == before
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.

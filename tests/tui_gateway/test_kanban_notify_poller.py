@@ -14,6 +14,8 @@ unsubscribe) and ``_format_kanban_event_text``.
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
     _collect_kanban_notifications,
@@ -230,6 +232,98 @@ class TestCollectKanbanNotifications:
         rows = _sub_rows(tid)
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
+
+    def test_filtered_completion_is_silent_then_block_delivers_once(self):
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(conn, title="filtered tui", assignee="worker")
+            kb.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="tui",
+                chat_id=SESSION_KEY,
+                delivery_metadata={"kanban_event_kinds": "blocked,archived"},
+            )
+            kb.complete_task(conn, tid, summary="ordinary child success")
+        finally:
+            conn.close()
+
+        assert _collect_kanban_notifications(_session()) == []
+        conn = kb.connect()
+        try:
+            kb._append_event(conn, tid, "blocked", {"reason": "needs owner"})
+        finally:
+            conn.close()
+        first = _collect_kanban_notifications(_session())
+        assert len(first) == 1
+        assert "needs owner" in first[0]
+        assert _collect_kanban_notifications(_session()) == []
+
+    def test_filtered_final_and_malformed_filters_deliver_completion(self):
+        conn = kb.connect()
+        try:
+            final_tid = kb.create_task(conn, title="final", assignee="personal")
+            kb.add_notify_sub(
+                conn,
+                task_id=final_tid,
+                platform="tui",
+                chat_id=SESSION_KEY,
+                delivery_metadata={"kanban_event_kinds": "completed,blocked,archived"},
+            )
+            kb.complete_task(conn, final_tid, summary="final accepted")
+            malformed_tid = kb.create_task(conn, title="legacy", assignee="worker")
+            kb.add_notify_sub(
+                conn,
+                task_id=malformed_tid,
+                platform="tui",
+                chat_id=SESSION_KEY,
+                delivery_metadata={"kanban_event_kinds": "unknown"},
+            )
+            kb.complete_task(conn, malformed_tid, summary="legacy completion")
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+        assert len(texts) == 2
+        assert sum("final accepted" in text for text in texts) == 1
+        assert sum("legacy completion" in text for text in texts) == 1
+        assert _collect_kanban_notifications(_session()) == []
+
+    @pytest.mark.parametrize(
+        ("kind", "payload", "needle"),
+        [
+            ("review_requested", {"summary": "review me"}, "ready for review"),
+            ("changes_requested", {"reason": "fix tests"}, "fix tests"),
+            (
+                "block_loop_detected",
+                {"reason": "same blocker", "recurrences": 2},
+                "TRIAGE",
+            ),
+        ],
+    )
+    def test_filtered_actionable_kind_delivers_once(self, kind, payload, needle):
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(conn, title=kind, assignee="worker")
+            kb.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="tui",
+                chat_id=SESSION_KEY,
+                delivery_metadata={
+                    "kanban_event_kinds": (
+                        "blocked,archived,block_loop_detected,review_requested,changes_requested"
+                    )
+                },
+            )
+            kb._append_event(conn, tid, kind, payload)
+        finally:
+            conn.close()
+
+        first = _collect_kanban_notifications(_session())
+        assert len(first) == 1
+        assert needle in first[0]
+        assert _collect_kanban_notifications(_session()) == []
 
 
 class TestFormatKanbanEventText:

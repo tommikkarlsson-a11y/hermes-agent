@@ -2,7 +2,6 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
-
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
@@ -624,6 +623,37 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert remaining == []
 
 
+def test_filtered_changes_requested_delivers_and_wakes_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "changes-filtered.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review rework", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+            delivery_metadata={
+                "kanban_event_kinds": "archived,changes_requested"
+            },
+        )
+        kb._append_event(
+            conn, tid, "changes_requested", {"reason": "fix tests"}
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "fix tests" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+
+
 # ---------------------------------------------------------------------------
 # Handoffs that hand a decision back to the origin must wake it, not only ping
 # it: `review_requested` (implementation done, waiting for a reviewer) and
@@ -745,3 +775,82 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_filtered_gateway_subscription_suppresses_completion_then_delivers_block(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "filtered-gateway.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="ordinary child", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+            delivery_metadata={
+                "route": "preserved",
+                "kanban_event_kinds": "blocked,archived",
+            },
+        )
+        kb.complete_task(conn, tid, summary="ordinary success")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+    assert adapter.handled == []
+
+    conn = kb.connect()
+    try:
+        kb._append_event(conn, tid, "blocked", {"reason": "decision needed"})
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "decision needed" in adapter.sent[0]["text"]
+    assert adapter.sent[0]["metadata"] == {"route": "preserved"}
+    assert len(adapter.handled) == 1
+
+
+def test_filtered_gateway_final_completion_and_malformed_filter_fail_open(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "filtered-final.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        final_tid = kb.create_task(conn, title="final acceptance", assignee="personal")
+        kb.add_notify_sub(
+            conn,
+            task_id=final_tid,
+            platform="telegram",
+            chat_id="final-chat",
+            delivery_metadata={"kanban_event_kinds": "completed,blocked,archived"},
+        )
+        kb.complete_task(conn, final_tid, summary="accepted result")
+
+        malformed_tid = kb.create_task(conn, title="legacy fail open", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=malformed_tid,
+            platform="telegram",
+            chat_id="legacy-chat",
+            delivery_metadata={"kanban_event_kinds": "unknown"},
+        )
+        kb.complete_task(conn, malformed_tid, summary="legacy result")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 2
+    assert {item["chat_id"] for item in adapter.sent} == {"final-chat", "legacy-chat"}
+    assert sum("accepted result" in item["text"] for item in adapter.sent) == 1

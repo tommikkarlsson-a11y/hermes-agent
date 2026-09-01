@@ -11920,7 +11920,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
-    "status", "archived", "unblocked",
+    "status", "archived", "unblocked", "block_loop_detected",
+    "review_requested", "changes_requested",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -12062,6 +12063,21 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         except (TypeError, ValueError):
             pass
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "review_requested":
+        summary = str(payload.get("summary") or "").strip().splitlines()
+        handoff = f"\n{summary[0][:200]}" if summary else ""
+        return f"👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+    if kind == "changes_requested":
+        reason = str(payload.get("reason") or "reviewer feedback requires changes")[:160]
+        return f"🛑 {board_tag}Kanban {task_id} review requested changes/BLOCK: {reason}"
+    if kind == "block_loop_detected":
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        recurrences = payload.get("recurrences")
+        count = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+        return (
+            f"🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE"
+            f" — needs a human decision{count}{reason}"
+        )
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None
@@ -12147,7 +12163,9 @@ def _collect_kanban_notifications(session: dict) -> list:
                     platform=sub["platform"],
                     chat_id=sub["chat_id"],
                     thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                    kinds=_kb.effective_notify_event_kinds(
+                        sub, _KANBAN_NOTIFY_KINDS
+                    ),
                 )
                 if not events:
                     continue

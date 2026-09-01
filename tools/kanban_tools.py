@@ -1405,6 +1405,22 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    notify_event_kinds = args.get("notify_event_kinds")
+    if notify_event_kinds is not None and not isinstance(
+        notify_event_kinds, (list, tuple)
+    ):
+        return tool_error(
+            "notify_event_kinds must be a list of terminal event names"
+        )
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        normalized_notify_event_kinds = (
+            _kanban_db.normalize_notify_event_kinds(notify_event_kinds)
+            if notify_event_kinds is not None else None
+        )
+    except ValueError as exc:
+        return tool_error(f"kanban_create: {exc}")
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -1461,9 +1477,12 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                notify_event_kinds=normalized_notify_event_kinds,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn, new_tid, notify_event_kinds=normalized_notify_event_kinds
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1481,7 +1500,12 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    notify_event_kinds: Optional[tuple[str, ...]] = None,
+) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
     Returns True if a subscription row was written, False otherwise (no
@@ -1574,6 +1598,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             except Exception:
                 notifier_profile = "default"
         delivery_metadata: dict[str, Any] = {}
+        if notify_event_kinds is not None:
+            delivery_metadata["kanban_event_kinds"] = ",".join(
+                notify_event_kinds
+            )
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:
@@ -2172,6 +2200,15 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "notify_event_kinds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional terminal event kinds accepted by this task's inherited "
+                    "and originating notification subscriptions. Omission preserves "
+                    "the existing full notifier behavior."
                 ),
             },
             "tenant": {

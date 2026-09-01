@@ -110,6 +110,69 @@ def test_child_task_inherits_parent_delivery_mode(kanban_home):
     assert subs[0]["delivery_mode"] == "notify+wake"
 
 
+def test_notify_event_kinds_validation_and_fail_open_parsing(kanban_home):
+    default = ("completed", "blocked", "archived")
+
+    assert kb.normalize_notify_event_kinds([" Archived ", "BLOCKED"]) == (
+        "blocked", "archived",
+    )
+    for invalid in ([], ["blocked", " BLOCKED "], ["not-a-kanban-event"]):
+        with pytest.raises(ValueError):
+            kb.normalize_notify_event_kinds(invalid)
+
+    assert kb.effective_notify_event_kinds(
+        {"delivery_metadata": {"kanban_event_kinds": "blocked,archived"}},
+        default,
+    ) == ("blocked", "archived")
+    for malformed in (
+        {"delivery_metadata": {"kanban_event_kinds": ""}},
+        {"delivery_metadata": {"kanban_event_kinds": "blocked,blocked"}},
+        {"delivery_metadata": {"kanban_event_kinds": "unknown"}},
+        {"delivery_metadata": {"kanban_event_kinds": 7}},
+        {"delivery_metadata": "not-a-dict"},
+    ):
+        assert kb.effective_notify_event_kinds(malformed, default) == default
+
+
+def test_child_filter_override_is_atomic_and_omission_inherits(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root", assignee=None)
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="chat1",
+            delivery_metadata={
+                "thread_anchor": "keep-me",
+                "kanban_event_kinds": "completed,blocked",
+            },
+        )
+        inherited = kb.create_task(
+            conn, title="inherits", assignee="worker", parents=[parent],
+        )
+        overridden = kb.create_task(
+            conn,
+            title="exceptions only",
+            assignee="worker",
+            parents=[parent],
+            notify_event_kinds=["archived", "blocked"],
+        )
+        inherited_sub = kb.list_notify_subs(conn, inherited)[0]
+        overridden_sub = kb.list_notify_subs(conn, overridden)[0]
+    finally:
+        conn.close()
+
+    assert inherited_sub["delivery_metadata"] == {
+        "thread_anchor": "keep-me",
+        "kanban_event_kinds": "completed,blocked",
+    }
+    assert overridden_sub["delivery_metadata"] == {
+        "thread_anchor": "keep-me",
+        "kanban_event_kinds": "blocked,archived",
+    }
+
+
 def test_notify_sub_chat_type_persists_and_last_write_wins(kanban_home):
     """chat_type persists, defaults to 'dm', an explicit re-subscribe is
     last-write-wins, and a None re-subscribe leaves it untouched. The

@@ -3166,6 +3166,37 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+KANBAN_NOTIFY_EVENT_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "review_requested",
+    "changes_requested",
+)
+KANBAN_EVENT_KINDS_METADATA_KEY = "kanban_event_kinds"
+
+
+def normalize_notify_event_kinds(event_kinds: Iterable[str]) -> tuple[str, ...]:
+    """Validate and return notification kinds in canonical notifier order."""
+    if isinstance(event_kinds, (str, bytes)):
+        raise ValueError("notify_event_kinds must be a non-empty list of event names")
+    cleaned: list[str] = []
+    for value in event_kinds:
+        if not isinstance(value, str):
+            raise ValueError("notify_event_kinds entries must be strings")
+        name = value.strip().lower()
+        if not name:
+            raise ValueError("notify_event_kinds entries must not be empty")
+        cleaned.append(name)
+    if not cleaned:
+        raise ValueError("notify_event_kinds must not be empty")
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError("notify_event_kinds contains duplicate event names")
+    unknown = sorted(set(cleaned) - set(KANBAN_NOTIFY_EVENT_KINDS))
+    if unknown:
+        raise ValueError(f"unknown notify_event_kinds: {', '.join(unknown)}")
+    selected = set(cleaned)
+    return tuple(kind for kind in KANBAN_NOTIFY_EVENT_KINDS if kind in selected)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3194,6 +3225,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    notify_event_kinds: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3237,6 +3269,10 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    normalized_notify_event_kinds = (
+        normalize_notify_event_kinds(notify_event_kinds)
+        if notify_event_kinds is not None else None
+    )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3565,7 +3601,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                _inherit_notify_subs(
+                    conn,
+                    task_id,
+                    parents,
+                    created_at=now,
+                    notify_event_kinds=normalized_notify_event_kinds,
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3594,6 +3636,7 @@ def _inherit_notify_subs(
     parents: Iterable[str],
     *,
     created_at: Optional[int] = None,
+    notify_event_kinds: Optional[Iterable[str]] = None,
 ) -> None:
     """Copy gateway notification subscriptions from parent tasks to a child.
 
@@ -3637,6 +3680,27 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+    if notify_event_kinds is not None:
+        encoded_kinds = ",".join(normalize_notify_event_kinds(notify_event_kinds))
+        rows = conn.execute(
+            "SELECT platform, chat_id, thread_id, delivery_metadata "
+            "FROM kanban_notify_subs WHERE task_id = ?",
+            (child_id,),
+        ).fetchall()
+        for sub in rows:
+            metadata = _decode_notify_delivery_metadata(sub["delivery_metadata"])
+            metadata[KANBAN_EVENT_KINDS_METADATA_KEY] = encoded_kinds
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_metadata = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (
+                    _encode_notify_delivery_metadata(metadata),
+                    child_id,
+                    sub["platform"],
+                    sub["chat_id"],
+                    sub["thread_id"],
+                ),
+            )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -11391,6 +11455,24 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
         for key, value in data.items()
         if isinstance(value, (str, int, float, bool))
     }
+
+
+def effective_notify_event_kinds(
+    subscription: Mapping[str, Any],
+    default: Iterable[str],
+) -> tuple[str, ...]:
+    """Return a subscription filter, failing open to ``default`` if malformed."""
+    default_kinds = tuple(default)
+    metadata = subscription.get("delivery_metadata")
+    if not isinstance(metadata, Mapping):
+        return default_kinds
+    raw = metadata.get(KANBAN_EVENT_KINDS_METADATA_KEY)
+    if not isinstance(raw, str):
+        return default_kinds
+    try:
+        return normalize_notify_event_kinds(raw.split(","))
+    except (TypeError, ValueError):
+        return default_kinds
 
 
 def add_notify_sub(

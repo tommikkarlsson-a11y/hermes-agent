@@ -484,7 +484,9 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=_kb.effective_notify_event_kinds(
+                                            sub, TERMINAL_KINDS
+                                        ),
                                     )
                                     if not events:
                                         continue
@@ -702,6 +704,7 @@ class GatewayKanbanWatchersMixin:
                             if isinstance(delivery_metadata, dict)
                             else {}
                         )
+                        metadata.pop(_kb.KANBAN_EVENT_KINDS_METADATA_KEY, None)
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
