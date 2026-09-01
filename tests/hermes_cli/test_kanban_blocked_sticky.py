@@ -53,6 +53,23 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def test_initial_block_is_sticky_until_explicit_unblock(kanban_home: Path) -> None:
+    """A parentless admission gate must not dispatch on the next tick."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="sealed admission root",
+            initial_status="blocked",
+        )
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
     """A standalone task that a worker explicitly blocks for review
     must stay blocked across an arbitrary number of dispatcher ticks.

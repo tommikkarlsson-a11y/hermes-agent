@@ -3601,6 +3601,18 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if initial_status == "blocked":
+                    # Admission-time blocks are deliberate operator gates, not
+                    # circuit-breaker residue.  Give recompute_ready the same
+                    # durable sticky signal that block_task() writes so a
+                    # parentless control card cannot dispatch between graph
+                    # creation and its explicit release.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {"reason": "initial_status", "source_status": "blocked"},
+                    )
                 _inherit_notify_subs(
                     conn,
                     task_id,
