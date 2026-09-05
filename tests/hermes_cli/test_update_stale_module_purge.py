@@ -17,6 +17,7 @@ module graph from the updated checkout.
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 import types
 
@@ -24,8 +25,6 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
-from hermes_cli import update_inventory
-from hermes_cli import update_receipt
 
 
 @pytest.fixture(autouse=True)
@@ -86,55 +85,28 @@ def test_purge_protects_executing_modules():
 
 
 def test_purge_preserves_active_update_receipt(tmp_path, monkeypatch):
-    """The in-flight receipt must survive the post-pull module purge."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    update_receipt._current = None
-    update_receipt.begin_update_receipt()
-    update_receipt.record_step("pre_pull", True)
+    """A receipt begun before the post-pull purge must still be finalizable."""
+    import hermes_cli.update_receipt as receipt
 
-    cli_main._purge_stale_hermes_modules()
+    receipt_dir = tmp_path / "update_receipts"
+    monkeypatch.setattr(receipt, "_receipt_dir", lambda: receipt_dir)
+    receipt._current = None
+    post_purge_receipt = receipt
+    try:
+        receipt.begin_update_receipt()
+        receipt.record_step("git_pull", True, "updated checkout")
 
-    reimported = importlib.import_module("hermes_cli.update_receipt")
-    assert reimported is update_receipt
-    path = reimported.finalize_update_receipt("success")
-    assert path is not None
-    assert path.is_file()
+        cli_main._purge_stale_hermes_modules()
+        post_purge_receipt = importlib.import_module("hermes_cli.update_receipt")
+        path = post_purge_receipt.finalize_update_receipt("success")
 
-
-def test_purge_preserves_update_inventory_type_identity():
-    """Pre-update plan rows must reconcile after the post-pull purge."""
-    plan = update_inventory.UpdatePlan(
-        runtimes=[
-            update_inventory.RuntimeRecord(
-                kind="gateway",
-                profile="personal",
-                pid=123,
-                restart_via="launchd",
-            )
-        ]
-    )
-
-    cli_main._purge_stale_hermes_modules()
-
-    reimported = importlib.import_module("hermes_cli.update_inventory")
-    assert reimported is update_inventory
-    outcomes = reimported.match_runtime_outcomes(
-        plan,
-        restarted_services=["hermes-gateway-personal"],
-        relaunched_profiles=[],
-        externally_supervised_profiles=[],
-        killed_pids=set(),
-        failed_units=[],
-    )
-    assert outcomes == [
-        {
-            "kind": "gateway",
-            "profile": "personal",
-            "pid": 123,
-            "mechanism": "launchd",
-            "outcome": "restarted",
-        }
-    ]
+        assert path is not None and path.is_file()
+        latest = json.loads((receipt_dir / "latest.json").read_text(encoding="utf-8"))
+        assert latest["outcome"] == "success"
+        assert latest["steps"][0]["name"] == "git_pull"
+    finally:
+        receipt._current = None
+        post_purge_receipt._current = None
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
@@ -189,3 +161,14 @@ def test_stale_symbol_scenario_end_to_end():
         sys.modules.pop(name, None)
         if real is not None:
             sys.modules[name] = real
+
+
+def test_purge_keeps_plan_record_class_identity():
+    # The pre-update plan is built BEFORE the purge; reconciliation after it filters with
+    # ``isinstance(r, RuntimeRecord)``. An evicted ``update_inventory`` yields a fresh class,
+    # every record fails the check, and the plan-vs-execution report goes silently empty.
+    from hermes_cli.update_inventory import RuntimeRecord as before
+
+    cli_main._purge_stale_hermes_modules()
+    from hermes_cli.update_inventory import RuntimeRecord as after
+    assert after is before
