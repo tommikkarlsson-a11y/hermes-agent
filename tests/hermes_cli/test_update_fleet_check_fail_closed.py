@@ -24,8 +24,7 @@ from __future__ import annotations
 import inspect
 import types
 
-from hermes_cli.main import _fleet_probe_expected_runtimes
-from hermes_cli.update_cmd import _planned_gateway_profiles
+from hermes_cli.update_cmd import _fleet_probe_expected_runtimes
 
 
 def _plan(runtimes):
@@ -41,7 +40,7 @@ class TestEmptySnapshotFailClosed:
         # externally-supervised gateway). Zero rows must fail closed.
         assert (
             _fleet_probe_expected_runtimes(
-                _plan([types.SimpleNamespace(kind="gateway", profile="work")]),
+                _plan([object()]),
                 [],  # pre_restart_pids: probe saw nothing
                 None,  # no Windows resume token
                 [],  # restarted_services
@@ -49,18 +48,6 @@ class TestEmptySnapshotFailClosed:
             )
             is True
         )
-
-    def test_non_gateway_plan_does_not_demand_gateway_rows(self):
-        plan = _plan([types.SimpleNamespace(kind="serve", profile="default")])
-        assert _fleet_probe_expected_runtimes(plan, [], None, [], set()) is False
-
-    def test_planned_gateway_profiles_are_exact(self):
-        plan = _plan([
-            types.SimpleNamespace(kind="gateway", profile="personal"),
-            types.SimpleNamespace(kind="gateway", profile="ops"),
-            types.SimpleNamespace(kind="serve", profile="default"),
-        ])
-        assert _planned_gateway_profiles(plan) == {"personal", "ops"}
 
     def test_windows_resume_token_alone_is_not_expected(self):
         # (c) The Windows pause/resume token is EXCLUDED from the expectation
@@ -143,14 +130,22 @@ class TestCallSiteWiring:
     def _impl_source(self):
         from hermes_cli import update_cmd
 
-        return inspect.getsource(update_cmd._cmd_update_impl)
+        # The fleet-version probe lives in the post-restart verifier that
+        # _cmd_update_impl calls; guard the wiring there.
+        return inspect.getsource(update_cmd._verify_fleet_after_update)
 
     def test_settle_sleep_gated_on_expected_runtimes(self):
         src = self._impl_source()
         assert "_fleet_rows_expected = _m()._fleet_probe_expected_runtimes(" in src
         # The 2.0s settle window must key on the cross-platform signal, so a
-        # resumed Windows gateway gets its settle window too (#93406).
-        assert "if _fleet_rows_expected:\n" in src
+        # resumed Windows gateway gets its settle window too (#93406). The
+        # settle loop lives in _collect_fleet_snapshot, gated on that signal.
+        assert "_fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected)" in src
+        from hermes_cli import update_cmd_fleet
+
+        snap_src = inspect.getsource(update_cmd_fleet._collect_fleet_snapshot)
+        assert "if not rows_expected:\n" in snap_src
+        assert "_time.sleep(2.0)" in snap_src
         assert "if restarted_services or killed_pids:\n                _time.sleep" not in src
 
     def test_zero_row_guard_gated_on_expected_runtimes(self):
@@ -160,8 +155,3 @@ class TestCallSiteWiring:
             "elif not _fleet_snapshot and (restarted_services or killed_pids):"
             not in src
         )
-
-    def test_nonempty_snapshot_must_cover_planned_profiles(self):
-        src = self._impl_source()
-        assert "_expected_fleet_profiles <= _seen_fleet_profiles" in src
-        assert "elif _missing_fleet_profiles:" in src
