@@ -32,6 +32,16 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 
+def build_kanban_worker_guidance(valid_tool_names) -> str:
+    """Resolve once per agent: tool access alone is not a worker assignment."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    return KANBAN_GUIDANCE if (
+        task_id and "kanban_show" in valid_tool_names and is_dispatcher_owned_worker_context()
+    ) else ""
+
+
 # Default read deadline for context files (SOUL.md, AGENTS.md, .cursorrules,
 # ...); overridable via ``context_file_read_timeout`` in config.yaml.
 # Intentionally short: network-backed filesystems (iCloud Drive, OneDrive,
@@ -1330,12 +1340,22 @@ def _build_skills_system_prompt_inner(
     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    skills_config = _config_readonly("skills prompt index").get("skills", {})
+    configured = skills_config.get("prompt_index_allowlist") if isinstance(skills_config, dict) else None
+    allowlist = frozenset(
+        name.strip() for name in configured
+    ) if (isinstance(configured, list) and configured
+          and all(isinstance(name, str) and name.strip() for name in configured)) else frozenset()
+    # Without discovery, keep all offers visible instead of stranding omitted skills.
+    if available_tools is not None and "skills_list" not in available_tools:
+        allowlist = frozenset()
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir), tuple(str(d) for d in external_dirs), tuple(str(d) for d in project_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+        tuple(sorted(allowlist)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1393,7 +1413,24 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
+    # Filter only the rendered offers, after every skill source and precedence rule.
+    # Snapshot, discovery, explicit loading, and disabled-skill policy remain unchanged.
+    omitted = False
+    if allowlist:
+        # The Hermes-help guidance slot depends on this entry being visible.
+        # Preserve it rather than let an index preference change other instructions.
+        selected = {cat: [(name, desc) for name, desc in entries if name in allowlist or name == "hermes-agent"]
+                    for cat, entries in skills_by_category.items()}
+        selected = {cat: entries for cat, entries in selected.items() if entries}
+        if any(name in allowlist for entries in selected.values() for name, _ in entries):
+            omitted = selected != skills_by_category
+            skills_by_category = selected
+        else:
+            logger.warning("skills.prompt_index_allowlist matched no visible skills; keeping full index")
     result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    if omitted:
+        result += ("\nThis is a shortlist, not the complete skill catalog. For a topic not covered here, "
+                   "use skills_list to discover relevant specialist skills, then skill_view to load them.")
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)

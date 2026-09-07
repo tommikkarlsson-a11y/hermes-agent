@@ -677,6 +677,27 @@ See [Code Execution](features/code-execution.md) and the [Terminal section of th
 
 ## Skill Settings
 
+### Automatic prompt shortlist
+
+`skills.prompt_index_allowlist` optionally limits **only** the skills listed in
+new sessions' system prompts. Use exact skill names from `skills_list`:
+
+```yaml
+skills:
+  prompt_index_allowlist:
+    - hermes-agent
+    - plan
+```
+
+Omitted skills remain available through `skills_list` and `skill_view`; this is
+not `skills.disabled`. The shortened prompt tells the agent to discover relevant
+specialist skills when needed. The `hermes-agent` help entry, when available,
+remains visible so the built-in help guidance does not change.
+Unset, empty, malformed, or entirely unmatched
+lists preserve the full index. Without the discovery tool, Hermes also keeps
+the full index. Changes apply to new sessions, not a conversation's cached
+prompt. Each profile owns its own setting.
+
 Skills can declare their own configuration settings via their SKILL.md frontmatter. These are non-secret values (paths, preferences, domain settings) stored under the `skills.config` namespace in `config.yaml`.
 
 ```yaml
