@@ -182,7 +182,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             continue
         role = m.get("role")
         # display_kind="hidden": model-facing scaffolding the "[System:" sniff does not catch.
-        if role not in _HISTORY_ROLES or m.get("display_kind") == "hidden":
+        if (role not in _HISTORY_ROLES or m.get("display_kind") == "hidden"
+                or (role == "assistant" and m.get("display_kind") == "intentional_silence")):
             continue
         content_text = _coerce_message_text(m.get("content"))
         if _is_display_hidden_marker(role, content_text):

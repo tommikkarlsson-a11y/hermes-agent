@@ -757,12 +757,17 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        error?: string
         failure_reason?: string
+        partial?: boolean
         reasoning?: string
         rendered?: string
         response_previewed?: boolean
+        silent?: boolean
+        status?: 'complete' | 'error' | 'interrupted'
         text?: string
         usage?: Usage
+        warning?: string
       }
       session_id?: string
       type: 'message.complete'

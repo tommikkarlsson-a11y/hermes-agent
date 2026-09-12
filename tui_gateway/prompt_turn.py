@@ -247,7 +247,17 @@ def _commit_turn_history(
 def _result_status(result: dict) -> str:
     return (
         "interrupted" if result.get("interrupted")
-        else "error" if result.get("error") else "complete")
+        else "error" if result.get("error") or result.get("failed") else "complete")
+
+
+def _silent_turn(result: Any, warning: str | None = None) -> bool:
+    from gateway.response_filters import is_intentional_silence_response
+    return (isinstance(result, dict) and not warning
+            and not any(result.get(k) for k in (
+                "failed", "error", "interrupted", "partial", "incomplete", "warning",
+                "warnings", "billing_block", "failure_reason"))
+            and result.get("status", "complete") in ("complete", "completed", "success")
+            and is_intentional_silence_response(result.get("final_response")))
 
 
 def _turn_outcome(result: Any) -> tuple[Any, str, str | None]:
@@ -338,7 +348,7 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
             pass  # transient DB failure — keep pending_title for retry
     # Voice fallback when the streaming pipeline couldn't start (tts_queue already spoke
     # everything otherwise); barge-aware.
-    if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
+    if not st.silent and st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
         try:
             threading.Thread(target=_speak_text_with_barge, args=(raw,), daemon=True).start()
         except ImportError:
@@ -433,6 +443,11 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    silent: bool = False
+    silence_stream_safe: bool = True
+    flush_stream_pending: Any = None
+    history_row_before: int = 0
+    silent_row: Any = None
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
@@ -510,7 +525,19 @@ def _invoke_agent(
     """Wire the streaming callbacks and run the conversation into ``st.result``."""
     agent = st.agent
 
-    def _stream(delta):
+    db = getattr(agent, "_session_db", None)
+    get_messages = getattr(db, "get_messages", None)
+    if callable(get_messages):
+        rows = get_messages(getattr(agent, "session_id", None) or session.get("session_key"),
+                            limit=1, latest=True)
+        st.history_row_before = rows[-1]["id"] if rows else 0
+
+    pending = ""
+    released = False
+
+    def _publish(delta):
+        if not delta:
+            return
         with session["history_lock"]:
             _append_inflight_delta(session, delta)
         payload = {"text": delta}
@@ -520,12 +547,43 @@ def _invoke_agent(
             st.tts_queue.put(delta)
         _emit("message.delta", sid, payload)
 
+    def _flush_pending():
+        nonlocal pending
+        text, pending = pending, ""
+        _publish(text)
+
+    st.flush_stream_pending = _flush_pending
+
+    def _stream(delta):
+        nonlocal pending, released
+        from gateway.response_filters import is_partial_silence_marker, _is_edge_punctuation
+        if released:
+            _publish(delta)
+            return
+        pending += delta
+        # Whitespace/punctuation may arrive in separate chunks before a marker.
+        # The exact gateway recognizer remains authoritative at segment end.
+        decoration = all(ch.isspace() or _is_edge_punctuation(ch) for ch in pending)
+        if len(pending) <= 64 and (decoration or is_partial_silence_marker(pending)):
+            return
+        released = True
+        st.silence_stream_safe = False
+        _flush_pending()
+
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
     # by the desktop as its own segment instead of being lost to message.complete.
     def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-        _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
-    agent.interim_assistant_callback = (
-        _interim_assistant_cb if _load_interim_assistant_messages() else None)
+        nonlocal pending, released, streamer
+        # An interim is NOT a proven successful terminal response, even if it
+        # resembles a marker. Release it, then start a fresh prefix decision.
+        _flush_pending()
+        if _load_interim_assistant_messages():
+            _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
+        pending, released = "", False
+        st.silence_stream_safe = True
+        if streamer:
+            streamer = make_stream_renderer(session.get("cols", 80))
+    agent.interim_assistant_callback = _interim_assistant_cb
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
     # not a raw user bubble; the post-turn stamp is the fallback for an older agent.
     st.run_kwargs = run_kwargs = {
@@ -624,18 +682,26 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     settles the hosted-room terminal receipt."""
     result, agent = st.result, st.agent
     raw, status, last_reasoning = _turn_outcome(result)
-    payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-    if last_reasoning:
+    warning = status_note or result.get("warning") or result.get("warnings")
+    st.silent = st.silence_stream_safe and _silent_turn(result, warning)
+    if not st.silent and st.flush_stream_pending:
+        st.flush_stream_pending()
+    payload = {"text": "" if st.silent else raw, "usage": _get_usage(agent), "status": status}
+    if st.silent:
+        payload["silent"] = True
+    if last_reasoning and not st.silent:
         payload["reasoning"] = last_reasoning
-    if status_note:
-        payload["warning"] = status_note
+    if warning:
+        payload["warning"] = str(warning)
+    if result.get("partial"):
+        payload["partial"] = True
     if result.get("response_previewed"):
         payload["response_previewed"] = True
     # Structured billing-wall descriptor: the client renders recovery without re-parsing text.
     if _billing_block := result.get("billing_block"):
         payload["billing"] = _billing_block
         payload["failure_reason"] = result.get("failure_reason")
-    if rendered := render_message(raw, cols):
+    if not st.silent and (rendered := render_message(raw, cols)):
         payload["rendered"] = rendered
     # Advisory {layer, code, retryable} descriptor; computed before the retain so resume
     # replay carries the same one.
@@ -676,9 +742,53 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     return payload, raw, status
 
 
+def _stamp_silent_terminal(session: dict, st: _TurnRun) -> None:
+    """Only the new terminal row gets provenance; legacy/interim markers stay visible."""
+    messages = st.result.get("messages") or []
+    row = messages[-1] if messages else None
+    raw = st.result.get("final_response")
+    if not (isinstance(row, dict) and row.get("role") == "assistant"
+            and row.get("content") == raw and not row.get("tool_calls")):
+        raise RuntimeError("Silent completion has no terminal history row")
+    db = getattr(st.agent, "_session_db", None)
+    key = getattr(st.agent, "session_id", None) or session["session_key"]
+    if db is not None:
+        rows = db.get_messages(key, limit=1, latest=True)
+        if not (rows and rows[-1]["id"] > st.history_row_before
+                and rows[-1].get("role") == "assistant"
+                and rows[-1].get("content") == raw and not rows[-1].get("tool_calls")):
+            raise RuntimeError("Silent completion has no newly persisted terminal row")
+    st.silent_row = (row, db, key, row.get("display_kind"), row.get("display_metadata"))
+    if db is not None and not db.set_latest_matching_message_display_kind(
+            key, role="assistant", content=raw, display_kind="intentional_silence"):
+        raise RuntimeError("Could not persist silent completion presentation metadata")
+    row["display_kind"] = "intentional_silence"
+
+
 def _recover_turn_exception(sid: str, session: dict, st: _TurnRun, e: BaseException) -> None:
     """Except-path of the turn: crash log, history restore, terminal error frame."""
     import traceback
+    st.silent = False
+    if st.silent_row is not None:
+        row, db, key, old_kind, old_metadata = st.silent_row
+        row.pop("display_kind", None)
+        row.pop("display_metadata", None)
+        if old_kind:
+            row["display_kind"] = old_kind
+        if old_metadata:
+            row["display_metadata"] = old_metadata
+        if db is not None:
+            try:
+                restored = db.set_latest_matching_message_display_kind(
+                    key, role="assistant", content=row["content"],
+                    display_kind=old_kind or "message", display_metadata=old_metadata)
+                if not restored:
+                    raise RuntimeError("Silent presentation rollback did not find its row")
+            except Exception as rollback_error:
+                logger.exception("silent completion presentation rollback failed")
+                e = RuntimeError(f"{e}; presentation rollback also failed: {rollback_error}")
+    if st.flush_stream_pending:
+        st.flush_stream_pending()
     with contextlib.suppress(Exception):
         os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
         with open(_CRASH_LOG, "a", encoding="utf-8") as f:
@@ -796,6 +906,8 @@ def _run_prompt_submit(
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)
+            if st.silent:
+                _stamp_silent_terminal(session, st)
             _emit("message.complete", sid, payload)
             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
             if status == "complete":

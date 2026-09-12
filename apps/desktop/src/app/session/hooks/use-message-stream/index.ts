@@ -563,7 +563,8 @@ export function useMessageStream({
       text: string,
       responsePreviewed?: boolean,
       failure?: { error: string; partial: boolean; surface?: ErrorSurface | null },
-      occurredAt = Date.now() / 1000
+      occurredAt = Date.now() / 1000,
+      silent = false
     ) => {
       let shouldHydrate = false
 
@@ -650,7 +651,22 @@ export function useMessageStream({
         const prev = state.messages
         let nextMessages = prev
 
-        if (streamId && prev.some(m => m.id === streamId)) {
+        if (silent) {
+          // Preserve real evidence; discard empty/reasoning-only open assistant rows.
+          nextMessages = prev.flatMap(message => {
+            if (message.role !== 'assistant' || (message.id !== streamId && !message.pending)) {
+              return [message]
+            }
+
+            const parts = completeOpenTimelineParts(message.parts, occurredAt)
+
+            if (!message.error && !parts.some(part => part.type !== 'reasoning' && (part.type !== 'text' || part.text.trim()))) {
+              return []
+            }
+
+            return [{ ...message, parts, pending: false, completedAt: occurredAt }]
+          })
+        } else if (streamId && prev.some(m => m.id === streamId)) {
           nextMessages = prev.map(m => (m.id === streamId ? completeMessage(m) : m))
         } else {
           const fallbackIndex = [...prev]
@@ -742,6 +758,7 @@ export function useMessageStream({
         // case hydrate would replace the live bubble with a stored empty
         // row (#95514; adoptedRunningTurn must not short-circuit).
         shouldHydrate =
+          !silent &&
           !completionError &&
           !hasInlineError &&
           // A visible user message with no reply after the terminal frame
@@ -790,12 +807,14 @@ export function useMessageStream({
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
 
-      dispatchNativeNotification({
-        body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
-        kind: 'turnDone',
-        sessionId,
-        title: translateNow('notifications.native.turnDoneTitle')
-      })
+      if (!silent) {
+        dispatchNativeNotification({
+          body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
+          kind: 'turnDone',
+          sessionId,
+          title: translateNow('notifications.native.turnDoneTitle')
+        })
+      }
     },
     [hydrateFromStoredSession, scheduleSessionsRefresh, updateSessionState]
   )

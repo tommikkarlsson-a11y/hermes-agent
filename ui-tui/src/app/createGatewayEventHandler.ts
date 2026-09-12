@@ -1449,21 +1449,31 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
+        const silent = ev.payload?.silent === true && ev.payload?.status === 'complete' && !ev.payload?.partial && !ev.payload?.warning && !ev.payload?.error && !ev.payload?.billing && !ev.payload?.failure_reason
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
         if (!wasInterrupted) {
-          const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
+          const msgs: Msg[] = silent
+            ? finalMessages.filter(message => message.kind !== 'trail' || message.text.trim() || message.tools?.length || message.todos?.length || message.toolTokens)
+            : finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
+
           msgs.forEach(appendMessage)
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
-          flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
+          if (!silent) {
+            flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
+          }
 
-          if (bellOnComplete && stdout?.isTTY) {
+          if (!silent && bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')
           }
         }
 
         setStatus('ready')
+
+        if (ev.payload?.warning) {
+          appendMessage({ role: 'system', text: String(ev.payload.warning) })
+        }
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage) }))

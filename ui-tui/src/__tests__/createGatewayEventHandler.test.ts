@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
+import { flashPet } from '../app/petFlashStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
@@ -12,6 +13,10 @@ import type { Msg } from '../types.js'
 // Mock the external-URL opener so the billing.step_up.verification test can
 // assert it's invoked without spawning a real browser process.
 const openExternalUrlMock = vi.fn((_url: string) => true)
+vi.mock(import('../app/petFlashStore.js'), async importOriginal => ({
+  ...(await importOriginal()),
+  flashPet: vi.fn()
+}))
 vi.mock('../lib/openExternalUrl.js', () => ({
   openExternalUrl: (url: string) => openExternalUrlMock(url)
 }))
@@ -65,6 +70,49 @@ describe('createGatewayEventHandler', () => {
     resetTurnState()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
+  })
+
+  it('settles intentional silence without a reply, bell or celebration and retains usage', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.system.bellOnComplete = true
+    ctx.system.stdout = { isTTY: true, write: vi.fn() }
+    const onEvent = createGatewayEventHandler(ctx)
+    onEvent({ type: 'message.start', payload: {} } as any)
+    vi.mocked(flashPet).mockClear()
+    onEvent({ type: 'reasoning.delta', payload: { text: 'Internal handling' } } as any)
+    onEvent({ type: 'message.complete', payload: { text: '', status: 'complete', silent: true, usage: { output: 7 } } } as any)
+    expect(appended.filter(m => m.role === 'assistant')).toEqual([])
+    expect(appended).toEqual([])
+    expect(ctx.system.stdout.write).not.toHaveBeenCalled()
+    expect(flashPet).not.toHaveBeenCalled()
+    expect(getUiState().status).toBe('ready')
+    expect(getUiState().usage?.output).toBe(7)
+    expect(getUiState().busy).toBe(false)
+  })
+
+  it('silent final retains real interim and tool activity; warnings remain visible', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    onEvent({ type: 'message.start', payload: {} } as any)
+    onEvent({ type: 'message.delta', payload: { text: 'Real progress' } } as any)
+    onEvent({ type: 'message.interim', payload: { text: 'Real progress', already_streamed: true } } as any)
+    onEvent({ type: 'tool.start', payload: { tool_id: 't1', name: 'read_file' } } as any)
+    onEvent({ type: 'tool.complete', payload: { tool_id: 't1', name: 'read_file', result: 'NO_REPLY' } } as any)
+    onEvent({ type: 'message.complete', payload: { text: '', silent: true, status: 'complete' } } as any)
+    expect(appended.filter(m => m.role === 'assistant').map(m => m.text)).toEqual(['Real progress'])
+    expect(appended.some(m => m.kind === 'trail')).toBe(true)
+    onEvent({ type: 'message.complete', payload: { text: 'NO_REPLY', warning: 'History not saved', status: 'complete' } } as any)
+    expect(appended.some(m => m.text === 'History not saved')).toBe(true)
+    expect(appended.some(m => m.text === 'NO_REPLY')).toBe(true)
+  })
+
+  it('ordinary empty completion still uses the existing reply fallback', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    onEvent({ type: 'message.start', payload: {} } as any)
+    onEvent({ type: 'message.complete', payload: { text: '', status: 'complete' } } as any)
+    expect(appended.filter(m => m.role === 'assistant')).toHaveLength(1)
   })
 
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {

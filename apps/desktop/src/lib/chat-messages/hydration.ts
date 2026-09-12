@@ -170,6 +170,12 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   }
 
   messages.forEach((message, index) => {
+    // REST prefetch bypasses the gateway's history projection. Only explicit
+    // terminal provenance hides a row; user and legacy marker text stay visible.
+    if (message.role === 'assistant' && message.display_kind === 'intentional_silence') {
+      return
+    }
+
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 

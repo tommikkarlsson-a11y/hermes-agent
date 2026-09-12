@@ -327,6 +327,22 @@ describe('toChatMessages', () => {
     expect(chatMessageText(message)).toBe('summarize @file:`src/main.ts` for me')
   })
 
+  it('hides proven silent terminals from REST history without hiding tools or ordinary markers', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'NO_REPLY', display_kind: 'intentional_silence', timestamp: 1 },
+      { role: 'assistant', content: 'NO_REPLY', timestamp: 2 },
+      { role: 'user', content: 'continue', timestamp: 3 },
+      { role: 'tool', name: 'read_file', content: 'verified evidence', timestamp: 4 },
+      { role: 'assistant', content: 'NO_REPLY', reasoning: 'internal receipt', display_kind: 'intentional_silence', timestamp: 5 },
+      { role: 'user', content: 'next', timestamp: 6 },
+      { role: 'assistant', content: 'NO_REPLY is literal content here.', timestamp: 7 }
+    ])
+
+    expect(messages.map(chatMessageText)).toEqual(['NO_REPLY', 'NO_REPLY', 'continue', '', 'next', 'NO_REPLY is literal content here.'])
+    expect(messages[3].parts.some(part => part.type === 'tool-call')).toBe(true)
+    expect(messages.flatMap(message => message.parts).some(part => part.type === 'reasoning')).toBe(false)
+  })
+
   it('never paints redirect scaffolding as an assistant bubble', () => {
     // What the desktop actually receives after a mid-stream steer: the runtime
     // keeps the interrupt scaffolding in a server-only api_content sidecar
