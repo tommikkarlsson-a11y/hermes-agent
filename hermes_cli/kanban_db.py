@@ -1581,10 +1581,34 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def _require_strict_recovery_target(conn: sqlite3.Connection, task_id: str) -> None:
+    """Opt-in routing guard; called under the mutation's existing write transaction."""
+    row = conn.execute(
+        "SELECT status, claim_lock, current_run_id, body, workflow_template_id, "
+        "current_step_key FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    allowed = {"triage", "todo", "scheduled", "ready", "blocked", "review"}
+    if row["status"] not in allowed or row["claim_lock"] is not None or row["current_run_id"] is not None:
+        raise ValueError(f"{task_id}: routing recovery requires an inactive nonterminal task")
+    linked = conn.execute(
+        "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ? LIMIT 1",
+        (task_id, task_id),
+    ).fetchone()
+    if (linked or row["workflow_template_id"] is not None or row["current_step_key"] is not None
+            or "[supervised-delivery:" in (row["body"] or "")):
+        raise ValueError(f"{task_id}: controlled or linked tasks require their own workflow recovery")
+
+
+def assign_task(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, strict_recovery: bool = False,
+) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        if strict_recovery:
+            _require_strict_recovery_target(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -1611,6 +1635,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
 def set_model_override(
     conn: sqlite3.Connection, task_id: str, model: Optional[str], provider: Optional[str] = None,
+    *, strict_recovery: bool = False,
 ) -> bool:
     """Set (empty ``model`` clears BOTH) the per-task model/provider override.
     Allowed while ``running``: it applies on the NEXT dispatch, which is the
@@ -1621,16 +1646,20 @@ def set_model_override(
         "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?", (model, provider),
         "model_override_set", {"model": model, "provider": provider},
         ("model_override", "provider_override"), archived_msg="cannot set model override",
+        strict_recovery=strict_recovery,
     )
 
 
 def _set_task_override(
     conn: sqlite3.Connection, task_id: str, sql: str, params: tuple, event_kind: str, payload: dict,
     changed_fields: tuple[str, ...], *, archived_msg: str,
+    strict_recovery: bool = False,
 ) -> bool:
     """Per-task override write: refuse archived tasks, record ``event_kind``,
     then fire the task-updated observer AFTER commit (RFC #58548)."""
     with write_txn(conn):
+        if strict_recovery:
+            _require_strict_recovery_target(conn, task_id)
         status = _task_status(conn, task_id)
         if status is None:
             return False
@@ -2524,16 +2553,18 @@ def reclaim_task(
 
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
-    reason: Optional[str] = None,
+    reason: Optional[str] = None, strict_recovery: bool = False,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
     ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
+    if strict_recovery and reclaim_first:
+        raise ValueError("strict routing recovery cannot reclaim a task")
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, strict_recovery=strict_recovery)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.

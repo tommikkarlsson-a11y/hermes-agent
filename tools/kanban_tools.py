@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -24,7 +25,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
-    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+    KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_REASSIGN_SCHEMA, KANBAN_SET_MODEL_SCHEMA)
 
 logger = logging.getLogger(__name__)
 
@@ -946,6 +947,51 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+def _routing_tool_task_id(tool_name: str, args: dict) -> str:
+    _reject_delegated_child_mutation(tool_name)
+    _check(not _delegation_ctx("is_delegated_child_process_context", True),
+           f"{tool_name}: delegated child processes cannot route tasks")
+    _require_orchestrator_tool(tool_name)
+    _check(_profile_has_kanban_toolset(), f"{tool_name}: current profile must opt into kanban")
+    tid = args.get("task_id")
+    _check(isinstance(tid, str) and tid.strip(), "task_id must be an explicit nonempty string")
+    tid = str(tid)
+    _check(re.fullmatch(r"t_[0-9a-f]{8,}", tid) is not None, "task_id must be an exact native task id")
+    _enforce_worker_task_ownership(tid)
+    return tid
+
+
+@_kanban_handler("kanban_reassign")
+def _handle_reassign(args: dict, **kw) -> str:
+    tid = _routing_tool_task_id("kanban_reassign", args)
+    assignee = args.get("assignee")
+    _check(isinstance(assignee, str) and assignee.strip(), "assignee must be a nonempty profile name")
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+    validate_profile_name(normalize_profile_name(str(assignee)))
+    with _board(args.get("board")) as (kb, conn):
+        _check(kb.reassign_task(conn, tid, assignee, strict_recovery=True),
+               f"could not reassign {tid}")
+        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("assignee", "status")))
+
+
+@_kanban_handler("kanban_set_model")
+def _handle_set_model(args: dict, **kw) -> str:
+    tid = _routing_tool_task_id("kanban_set_model", args)
+    clear = args.get("clear_override", False)
+    _check(type(clear) is bool, "clear_override must be a boolean")
+    model, provider = args.get("model"), args.get("provider")
+    if clear:
+        _check(model is None and provider is None, "clear_override cannot be combined with model/provider values")
+    else:
+        _check(isinstance(model, str) and model.strip(), "provide a nonempty model or explicit clear_override=true")
+        _check(provider is None or (isinstance(provider, str) and provider.strip()),
+               "provider must be a nonempty string when provided")
+    with _board(args.get("board")) as (kb, conn):
+        _check(kb.set_model_override(conn, tid, model, provider, strict_recovery=True),
+               f"could not change model override for {tid}")
+        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("model_override", "provider_override", "status")))
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links → ValueError)."""
@@ -961,7 +1007,7 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock", "kanban_reassign", "kanban_set_model"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -976,6 +1022,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_reassign", KANBAN_REASSIGN_SCHEMA, _handle_reassign, "↪"),
+    ("kanban_set_model", KANBAN_SET_MODEL_SCHEMA, _handle_set_model, "⚙"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:

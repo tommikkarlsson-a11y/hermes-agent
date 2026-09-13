@@ -505,6 +505,32 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_REASSIGN_SCHEMA = _schema(
+    "kanban_reassign",
+    "Reassign an inactive standalone task without starting it. Orchestrator-only and explicitly "
+    "Kanban-opted-in profiles only. Refuses running, claimed, terminal, linked and controlled "
+    "workflow tasks; never reclaims, completes, skips review, or rewrites a seal.",
+    {
+        "task_id": _prop("string", "Exact existing task id; required explicitly."),
+        "assignee": _prop("string", "Profile that will own the task. Verify its readiness before rerouting."),
+    },
+    ["task_id", "assignee"],
+)
+
+KANBAN_SET_MODEL_SCHEMA = _schema(
+    "kanban_set_model",
+    "Set or explicitly clear task-specific model/provider overrides on an inactive standalone task. "
+    "Orchestrator-only and Kanban-opted-in profiles only. Refuses running, claimed, terminal, linked "
+    "and controlled tasks. Preserves reasoning effort, review phase and task status; does not start work.",
+    {
+        "task_id": _prop("string", "Exact existing task id; required explicitly."),
+        "model": _prop("string", "Nonempty model override. Omit when clearing."),
+        "provider": _prop("string", "Provider for the model, if needed. Omit when clearing."),
+        "clear_override": _prop("boolean", "Set true to clear BOTH overrides and use profile defaults. Cannot accompany model/provider values."),
+    },
+    ["task_id"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
