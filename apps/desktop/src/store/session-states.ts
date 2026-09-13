@@ -57,7 +57,7 @@ import {
 } from './session'
 import { secondaryProfileOwnerForEvent } from './session-event-provenance'
 import { $focusedTreePaneId } from './session-focus'
-import { assertSessionOwnerResolved } from './session-owner-resolution'
+import { assertSessionOwnerResolved, sessionOwnerIsKnown } from './session-owner-resolution'
 import {
   requestForSessionProfile,
   type SessionOwnerRoute,
@@ -92,6 +92,16 @@ const sessionScopeByRuntimeId = new Map<string, string>()
 // (approval.respond) when every durable binding (tile / hint / row) is absent
 // — while durable stored identity keeps outranking it (#97511).
 const sessionOwnerByRuntimeId = new Map<string, SessionOwnerScope>()
+
+/** Bind the owner proven by a create response before a draft has rows or events.
+ * The caller supplies the route used for the request, never later UI state. */
+export function recordCreatedSessionOwner(sessionId: string, owner: SessionOwnerScope): void {
+  if (!sessionId || !sessionOwnerIsKnown(owner)) {
+    return
+  }
+
+  sessionOwnerByRuntimeId.set(sessionId, owner)
+}
 
 export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
   if (!event.session_id) {

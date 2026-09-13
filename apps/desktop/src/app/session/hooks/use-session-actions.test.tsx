@@ -67,7 +67,7 @@ import {
 } from '@/store/session'
 import { $removedSessionIds, $sessionMutationsInFlight } from '@/store/session-removal'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
+import { $sessionTiles, knownOwnerForSession, requestForOwnedSession, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -4094,6 +4094,42 @@ describe('createBackendSessionForSend workspace target', () => {
 })
 
 describe('openNewSessionTile workspace target', () => {
+  it('keeps the proven profile owner for an unlisted draft before its first event or message', async () => {
+    $profiles.set([{ name: 'default' }, { name: 'personal' }] as never)
+    $activeGatewayProfile.set('personal')
+    $newChatProfile.set('personal')
+    $newChatRoute.set(null)
+    setSessions([])
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return {
+          info: { cwd: '', model: 'test-model', tools: {}, skills: {} },
+          session_id: 'runtime-profile-draft',
+          stored_session_id: 'stored-profile-draft'
+        } as never
+      }
+      return {} as never
+    })
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: null, listed: false, route: null })
+    })
+    expect(requestGateway).toHaveBeenCalledWith('session.create', expect.objectContaining({ profile: 'personal' }))
+    expect($sessions.get().some(row => row.id === 'stored-profile-draft')).toBe(false)
+    expect(knownOwnerForSession('runtime-profile-draft')).toBe('personal')
+    await requestForOwnedSession('runtime-profile-draft', requestGateway, 'session.control.read', {
+      session_id: 'runtime-profile-draft'
+    })
+    expect(requestGatewayForProfile).toHaveBeenCalledWith('personal', 'session.control.read', {
+      session_id: 'runtime-profile-draft'
+    }, undefined, undefined)
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+    $profiles.set([])
+  })
+
   afterEach(() => {
     cleanup()
     $projectScope.set(ALL_PROJECTS)

@@ -116,6 +116,7 @@ import {
   openSessionTile,
   patchSessionTile,
   publishSessionState,
+  recordCreatedSessionOwner,
   releaseSessionOwnerHold,
   type SessionTileWorkspaceScope,
   type TileDock
@@ -573,7 +574,7 @@ export function useSessionActions({
         // different socket than the one that minted the runtime.
         const capturedRoute = resolveNewChatOwnerRoute()
 
-        const params = {
+        const params: Record<string, unknown> = {
           ...(await desktopSessionCreateParams(cwd, capturedRoute)),
           ...sessionCreateOverrideParams(createOverrides, seedMessages)
         }
@@ -600,6 +601,10 @@ export function useSessionActions({
                 params
               )
             : await requestGateway<SessionCreateResponse>('session.create', params)
+
+          // The unlisted profile-only draft has no sidebar row or event yet.
+          // Preserve the profile sent in this request before chrome can move.
+          recordCreatedSessionOwner(created.session_id, capturedRoute || String(params.profile || ''))
 
           stored = created.stored_session_id ?? null
 
@@ -773,7 +778,7 @@ export function useSessionActions({
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
 
-        const params = {
+        const params: Record<string, unknown> = {
           ...(await desktopSessionCreateParams(cwd, capturedRoute)),
           ...(workspaceScope.workspaceMode === 'bots' ? { hidden: true } : {})
         }
@@ -797,6 +802,10 @@ export function useSessionActions({
                 params
               )
             : await requestGateway<SessionCreateResponse>('session.create', params)
+
+          // The unlisted profile-only draft has no sidebar row or event yet.
+          // Preserve the profile sent in this request before chrome can move.
+          recordCreatedSessionOwner(created.session_id, capturedRoute || String(params.profile || ''))
 
           stored = created.stored_session_id
 
