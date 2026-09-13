@@ -69,7 +69,7 @@ def run_turn(monkeypatch, tmp_path, chunks, *, result_extra=None, interim=None,
     monkeypatch.setattr(server.threading, 'Thread', InlineThread)
     monkeypatch.setattr(server, '_admit_prompt_turn', lambda *a: ([], agent))
     monkeypatch.setattr(server, '_prepare_turn_input', prepare)
-    monkeypatch.setattr(server, '_record_turn_marker', lambda *a: '')
+    monkeypatch.setattr(server, '_record_turn_marker', lambda *a, **kw: '')
     monkeypatch.setattr(server, '_retire_turn_marker', lambda *a: None)
     monkeypatch.setattr(server, '_start_usage_ticker', lambda *a: (threading.Event(), SimpleNamespace(join=lambda: None)))
     monkeypatch.setattr(server, '_get_usage', lambda *a: {'output': 7})

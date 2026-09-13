@@ -199,6 +199,10 @@ def test_schema_gating_matches_existing_controller_tools(routing_env, monkeypatc
 
 
 def test_review_resumption_preserves_original_implementer_and_real_review_route(routing_env, monkeypatch):
+    from hermes_cli.profiles import get_profile_dir
+
+    # Review routing now requires a real installed profile, even in fixtures.
+    get_profile_dir("old-reviewer").mkdir(parents=True)
     kb, kbc, _, _, board, tid = routing_env
 
     def worker_call(name, **args):
