@@ -219,43 +219,45 @@ def _ensure_test_isolation(db_path: Path) -> None:
 
 
 def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
-    """Create/tighten a writable state database and its sidecars to 0600.
+    """Keep state files private without releasing live SQLite POSIX locks.
 
-    SQLite otherwise creates ``state.db``, ``-wal``, and ``-shm`` according to
-    the process umask (commonly 0644 under 0022). Use file descriptors so a
-    missing main database is private from its first byte and O_NOFOLLOW can
-    refuse a planted symlink. Read-only SessionDB attachments never call this
-    helper and remain observational.
+    Closing any descriptor for an existing SQLite inode can cancel this
+    process's locks, including the WAL shared-memory DMS lock. Tighten
+    existing files without opening them; refuse symlinks as before.
+    Read-only SessionDB attachments remain observational.
     """
+    import errno
+    import stat
+
     if os.name == "nt":
         return
 
-    for index, path in enumerate(
-        (
-            db_path,
-            db_path.with_name(db_path.name + "-wal"),
-            db_path.with_name(db_path.name + "-shm"),
-        )
-    ):
-        flags = os.O_RDONLY
-        if index == 0 and create_main:
-            flags = os.O_WRONLY | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
+    if create_main:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
         try:
-            fd = os.open(path, flags, 0o600)
+            fd = os.open(db_path, flags, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            # O_EXCL ensures we never open/close an already-held database inode.
+            os.close(fd)
+
+    for path in (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise OSError(errno.ELOOP, "Refusing a symlink state database file", str(path))
+            if stat.S_ISDIR(info.st_mode):
+                # Let sqlite3.connect() report the canonical non-database error.
+                continue
+            os.chmod(path, 0o600, follow_symlinks=False)
         except FileNotFoundError:
             continue
-        except IsADirectoryError:
-            # Not a database file at all; sqlite3.connect() raises the
-            # canonical error for this, and a directory leaks no row data.
-            continue
-        try:
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
 
 
 # Openings of the background-review harness prompts (agent/background_review.py).
