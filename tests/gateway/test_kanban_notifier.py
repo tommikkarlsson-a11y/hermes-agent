@@ -23,6 +23,7 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        event._gateway_accepted = True
 
 
 class DisconnectedAdapters(dict):
